@@ -30,7 +30,8 @@ def load_env_file(path: Path) -> None:
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as e:
         raise ConfigError(f"{path} 를 UTF-8 로 저장해 주세요 (메모장: 다른 이름으로 저장 → 인코딩 UTF-8).") from e
-    for raw in text.splitlines():
+    values: dict[str, tuple[str, int]] = {}
+    for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -39,6 +40,13 @@ def load_env_file(path: Path) -> None:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        prev = values.get(key)
+        if prev is not None and prev[0] and value and prev[0] != value:
+            raise ConfigError(f"{path} 에 {key} 가 {prev[1]}번째 줄과 {lineno}번째 줄에 서로 다른 값으로 "
+                              "두 번 있습니다. 하나만 남겨 주세요.")
+        if prev is None or not prev[0]:  # 빈 값은 뒤에 나온 실제 값으로 채운다
+            values[key] = (value, lineno)
+    for key, (value, _) in values.items():
         os.environ.setdefault(key, value)
 
 

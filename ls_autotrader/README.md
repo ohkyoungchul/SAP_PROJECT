@@ -13,7 +13,7 @@ LS증권 OPEN API(REST + WebSocket)를 사용하며, Windows PC에서 Python으�
 | 익절 | 현재가 ≥ 평균단가 × 1.10 → 시장가 전량 매도 | `TAKE_PROFIT_PCT` |
 | 손절 | 현재가 ≤ 평균단가 × 0.97 → 시장가 전량 매도 | `STOP_LOSS_PCT` |
 | 신규 매수 시간 | 평일 09:00 ~ 15:15 | `BUY_START`, `BUY_END` |
-| 익절/손절 주문 시간 | 평일 09:00 ~ 15:30. 장 시간 외에는 시장가 주문이 거부되므로 다음 장 시작 때 판단 | 고정 |
+| 익절/손절 주문 시간 | 평일 09:00 ~ 15:30. 장 시간 외에는 시장가 주문이 거부되므로 다음 장 시작 때 판단. 공휴일·거래정지로 거부되면 재시도 간격을 최대 5분까지 늘림 | 고정 |
 | 당일 재매수 | 안 함. 그날 사거나 판 종목은 다시 편입돼도 그날은 사지 않음 | `REBUY_SAME_DAY` |
 
 - 익절·손절 수익률은 **평균단가 기준 단순 수익률**입니다. 수수료와 세금은 빼지 않습니다.
@@ -49,7 +49,18 @@ copy .env.example .env
 notepad .env
 ```
 
-`.env`에서 최소한 다음을 채웁니다. 메모장으로 저장할 때 인코딩은 UTF-8로 하세요.
+**Git 없이 ZIP으로 받은 경우**
+- `git clone` 줄은 건너뜁니다.
+- 압축을 푼 폴더 안에서 `README.md`와 `requirements.txt`가 있는 `ls_autotrader` 폴더로 이동합니다.
+  - 예: `cd %USERPROFILE%\Downloads\SAP_PROJECT-claude-quirky-tesla-le47nl\ls_autotrader`
+- 그다음 `py -m venv .venv`부터 실행합니다.
+
+`.env` 파일 작성 요령
+- **이미 있는 줄에 값을 채웁니다.** 아래 내용을 파일 끝에 덧붙이지 마세요.
+  - 같은 키가 서로 다른 값으로 두 번 있으면 실행을 멈추고 알려줍니다.
+- 메모장으로 저장할 때 인코딩은 UTF-8로 하세요.
+
+최소한 채워야 하는 값:
 
 ```
 LS_APPKEY=모의투자 App Key
@@ -64,7 +75,8 @@ CONDITION_NAME=떡상이
 :: (1) 서버에 저장된 조건식 목록 확인
 .venv\Scripts\python -m autotrader --list-conditions
 
-:: (2) DRY_RUN=true (기본) 로 장중 실행 → 신호와 매수/매도 판단이 로그에만 찍힘
+:: (2) DRY_RUN=true (기본) 로 장중 실행 → 조건검색 신호와 매수 판단만 로그에 찍힘
+::     (익절/손절은 실제 보유 종목이 있어야 하므로 DRY_RUN=false 모의투자에서 확인)
 .venv\Scripts\python -m autotrader
 
 :: (3) 로그가 정상이면 .env 의 DRY_RUN=false 로 바꿔 모의투자 주문 시작
@@ -93,7 +105,13 @@ LS_DATA_APPSECRET=실전 Secret Key
 - `TRADING_MODE=paper`인데 `LS_APPKEY`가 실전 키로 보이면 시작하지 않습니다.
   - 판단 기준: 계좌조회(CSPAQ12200) 응답 메시지에 '모의투자'라는 글자가 있는지입니다.
   - 이 확인을 끄는 `SKIP_ENV_CHECK=true`는 `REAL_TRADING_CONFIRM`도 함께 넣어야만 동작합니다.
-- 상태 파일은 모드(모의/실전)와 계좌별로 따로 저장됩니다. 모의투자 때 산 종목 정보로 실전 계좌의 종목을 파는 일은 없습니다.
+- 상태 파일은 모드(모의/실전)와 App Key별로 따로 저장됩니다. 모의투자 때 산 종목 정보로 실전 계좌의 종목을 파는 일은 없습니다.
+- 다른 App Key나 이전 버전(`data\state.json`)의 상태 파일에 봇이 산 종목이 남아 있으면 실행하지 않고 알려줍니다.
+  - App Key 재발급 등으로 **같은 계좌**라면 아래 명령으로 가져옵니다.
+    ```bat
+    .venv\Scripts\python -m autotrader --adopt-state data\파일이름.json
+    ```
+  - 다른 계좌라면 그 파일을 다른 폴더로 옮기세요.
 - 실거래(`TRADING_MODE=real`)는 `REAL_TRADING_CONFIRM=I_UNDERSTAND_REAL_MONEY`까지 넣어야만 실행됩니다.
 - 주문 응답이 타임아웃 등으로 불분명할 때가 있습니다. 이때는 재주문하지 않습니다. 주문이 들어간 것으로 보고 잔고로 확인한 뒤 감시합니다.
 - 매수 주문을 보내기 전에 '주문 중' 상태를 먼저 파일에 기록합니다. 주문 도중 프로그램이 꺼져도 체결된 종목이 감시 대상에서 빠지지 않습니다.
@@ -104,7 +122,7 @@ LS_DATA_APPSECRET=실전 Secret Key
 |---|---|
 | `logs\autotrader_YYYYMMDD.log` | 전체 실행 로그 |
 | `trades.csv` | 매수/매도 주문 기록. 엑셀로 열어 두면 기록이 메모리에 보관됐다가, 파일을 닫은 뒤 다음 주문 때 함께 기록됨 |
-| `state_<모드>_<계좌지문>.json` (+ `.bak`) | 봇이 산 종목, 당일 매수/매도 이력, 미체결 주문. 깨져 있으면 실행을 멈추고 알림 |
+| `state_<모드>_<App Key 지문>.json` (+ `.bak`) | 봇이 산 종목, 당일 매수/매도 이력, 미체결 주문. 깨져 있으면 실행을 멈추고 알림 |
 | `tokens\` | 접근토큰 캐시 (다음 날 07:00 만료). 재시작해도 토큰을 다시 발급받지 않기 위한 파일 |
 | `realtime.json` | 실시간 조건검색 등록 정보. 비정상 종료 뒤 다음 실행 때 등록을 해제하는 데 씀 |
 

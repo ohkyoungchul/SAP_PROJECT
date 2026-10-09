@@ -152,6 +152,7 @@ class LsRestClient:
         self._token = ""
         self._refresh_at: datetime | None = None
         self._last_issue_mono = float("-inf")
+        self._boundary: datetime | None = None  # 07:00 직전에 발급받아 07:00 이후 갱신을 기다리는 경계 시각
         self._token_lock = threading.Lock()
         self.token_version = 0  # 토큰이 바뀔 때마다 증가 (WebSocket 재접속 판단용)
         self._cache_file: Path | None = None
@@ -211,10 +212,18 @@ class LsRestClient:
         issued = self._now()
         expires_in = to_int(body.get("expires_in") or body.get("expire_in")) or 86400
         expiry = next_token_expiry(issued, expires_in)
+        boundary = self._boundary
         if expiry - issued <= timedelta(minutes=10):
-            # 07:00 직전 발급: 새로 받아도 07:00 에 만료되므로 07:00 이 지난 뒤 한 번만 갱신
-            self._refresh_at = expiry + timedelta(seconds=5)
+            # 07:00 직전 발급: 새로 받아도 07:00 에 만료되므로 07:00 이 지난 뒤 갱신.
+            # PC 시계가 LS 서버보다 빠를 수 있어 2분 여유를 둔다.
+            self._boundary = expiry
+            self._refresh_at = expiry + timedelta(minutes=2)
+        elif (boundary is not None and token == self._token
+              and issued - boundary < timedelta(minutes=15)):
+            # 07:00 직후인데 어제 토큰이 그대로 왔다 → PC 시계가 빨라 아직 서버는 07:00 전. 1분 뒤 재시도
+            self._refresh_at = issued + timedelta(minutes=1)
         else:
+            self._boundary = None
             self._refresh_at = expiry - timedelta(minutes=5)
         if token != self._token:
             self.token_version += 1

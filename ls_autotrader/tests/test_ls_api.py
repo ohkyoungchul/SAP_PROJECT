@@ -363,9 +363,32 @@ def test_token_issued_just_before_0700_refreshes_once_after():
         clock["now"] = datetime(2026, 10, 9, 6 if minute else 7, minute, sec, tzinfo=KST)
         _ = client.token
     assert session.token_count == 1
-    clock["now"] = datetime(2026, 10, 9, 7, 0, 6, tzinfo=KST)
+    clock["now"] = datetime(2026, 10, 9, 7, 1, 50, tzinfo=KST)
+    assert client.token == "tok1"  # PC 시계가 빠를 수 있어 07:02 까지 기다림
+    clock["now"] = datetime(2026, 10, 9, 7, 2, 1, tzinfo=KST)
     assert client.token == "tok2"
     assert session.token_count == 2
+
+
+def test_stale_token_after_0700_is_retried_soon():
+    """N3: PC 시계가 빨라 07:00 직후에 어제 토큰이 다시 오면 1분 뒤 다시 받는다."""
+    class Stale(FakeSession):
+        def post(self, url, **kw):
+            r = super().post(url, **kw)
+            if url.endswith("/oauth2/token") and self.token_count <= 2:
+                r._body["access_token"] = "OLD"
+            return r
+
+    session = Stale()
+    clock = {"now": datetime(2026, 10, 9, 6, 56, tzinfo=KST)}
+    client = make_client(session, now=lambda: clock["now"])
+    assert client.token == "OLD"
+    v = client.token_version
+    clock["now"] = datetime(2026, 10, 9, 7, 2, 1, tzinfo=KST)
+    assert client.token == "OLD"  # 서버는 아직 07:00 전이라 같은 토큰
+    clock["now"] = datetime(2026, 10, 9, 7, 3, 2, tzinfo=KST)
+    assert client.token == "tok3"  # 1분 뒤 새 토큰
+    assert client.token_version == v + 1
 
 
 def test_same_token_does_not_bump_version():

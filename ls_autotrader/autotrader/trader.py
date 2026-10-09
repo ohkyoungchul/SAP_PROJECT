@@ -29,14 +29,16 @@ from typing import Callable, Protocol
 from .config import Settings
 from .ls_api import valid_code
 from .models import ConditionSignal, Holding, OrderResult, Quote
-from .strategy import (STOP_LOSS, TAKE_PROFIT, calc_buy_qty, exit_reason, in_buy_window,
-                       in_sell_window)
+from .strategy import (PRUNE_END, SELL_START, STOP_LOSS, TAKE_PROFIT, calc_buy_qty, exit_reason,
+                       in_buy_window, in_sell_window)
 
 log = logging.getLogger(__name__)
 
 REASON_TEXT = {TAKE_PROFIT: "익절", STOP_LOSS: "손절"}
 MISS_CONFIRM = 3  # 잔고에서 연속 몇 번 안 보여야 '없음'으로 확정할지
 MAX_SIGNALS_PER_STEP = 3  # 한 번의 step 에서 처리할 신호 수 (손절 감시가 밀리지 않게)
+SIGNAL_TIME_BUDGET_SEC = 1.0  # 한 번의 step 에서 신호 처리에 쓸 최대 시간
+SELL_REJECT_BACKOFF_MAX_SEC = 300.0  # 매도 거부(거래정지·휴장 등)가 반복될 때 재시도 간격 상한
 
 
 class Broker(Protocol):
@@ -177,7 +179,10 @@ class AutoTrader:
         self.pending_buys: dict[str, PendingBuy] = {}
         self.pending_sells: dict[str, PendingSell] = {}
         self._dry_bought: set[str] = set()  # DRY_RUN 가상 매수 (파일에 저장하지 않음)
-        self._miss: dict[str, int] = {}
+        self._miss: dict[str, int] = {}  # 관리 종목이 잔고에서 연속으로 안 보인 횟수
+        self._recent: dict[str, int] = {}  # 최근 잔고에 있던 모든 종목 (한 번 빠져도 '보유'로 간주)
+        self._order_mono: dict[tuple[str, str], float] = {}  # (BUY|SELL, 종목) → 주문 시각(단조시계)
+        self._sell_rejects: dict[str, int] = {}
         self._state_date = ""
         self._holdings_loaded = False
         self._next_reconcile = 0.0
@@ -229,6 +234,7 @@ class AutoTrader:
             self.sold_today.clear()
             self._dry_bought.clear()
             self.pending_buys.clear()
+            self._sell_rejects.clear()
             self._save_state()
 
     # ------------------------------------------------------------ input
@@ -267,13 +273,23 @@ class AutoTrader:
         now = self._clock()
         changed = False
 
+        for code in set(self._recent) | set(holdings):
+            n = 0 if code in holdings else self._recent.get(code, 0) + 1
+            if n >= MISS_CONFIRM:
+                self._recent.pop(code, None)
+            else:
+                self._recent[code] = n
         tracked = self.managed | set(self.pending_buys) | set(self.pending_sells)
         for code in tracked:
             self._miss[code] = 0 if code in holdings else self._miss.get(code, 0) + 1
         for code in list(self._miss):
             if code not in tracked:
                 del self._miss[code]
-        gone = {c for c in tracked if self._miss.get(c, 0) >= MISS_CONFIRM}
+        # '없어졌다'는 판단은 봇이 팔 수 있었던 시간(평일 장중 + 마감 동시호가 반영 여유)에만 한다.
+        # 밤사이 점검 시간의 빈 응답 때문에 관리 종목을 잃지 않기 위해서다.
+        may_prune = in_buy_window(self._now(), SELL_START, PRUNE_END)
+        gone = ({c for c in tracked if self._miss.get(c, 0) >= MISS_CONFIRM}
+                if may_prune else set())
 
         for code, pb in list(self.pending_buys.items()):
             h = holdings.get(code)
@@ -281,7 +297,8 @@ class AutoTrader:
                 log.info("매수 체결 확인: %s %s %d주 평균단가 %.0f", code, h.name, h.qty, h.avg_price)
                 del self.pending_buys[code]
                 changed = True
-            elif not pb.delay_warned and now - pb.ordered_at > self._s.buy_fill_timeout_sec:
+            elif not pb.delay_warned and self._elapsed("BUY", code, pb.ordered_at, now) > \
+                    self._s.buy_fill_timeout_sec:
                 pb.delay_warned = True
                 log.warning("매수 주문 %s(%s)이 %.0f초 넘게 다 체결되지 않았습니다 (현재 %d/%d주). "
                             "VI 등으로 지연될 수 있어 장 마감까지 주문 중으로 보고 종목 수에 포함합니다.",
@@ -295,14 +312,15 @@ class AutoTrader:
                     log.info("매도 완료 확인: %s %s (%s)", code, ps.name,
                              REASON_TEXT.get(ps.reason, ps.reason))
                     del self.pending_sells[code]
+                    self._sell_rejects.pop(code, None)
                     changed = True
             elif h.qty > ps.held_qty:
                 log.info("매도 주문 이후 추가로 체결된 수량이 있어 다시 판단합니다: %s %d주", code, h.qty)
                 del self.pending_sells[code]
                 changed = True
-            elif now - ps.ordered_at > self._s.sell_retry_sec:
+            elif self._elapsed("SELL", code, ps.ordered_at, now) > self._sell_retry_delay(code):
                 log.warning("매도 주문 후 %.0f초가 지나도 잔고가 남아 있습니다: %s %d주 → 다시 판단합니다.",
-                            self._s.sell_retry_sec, code, h.qty)
+                            self._sell_retry_delay(code), code, h.qty)
                 del self.pending_sells[code]
                 changed = True
 
@@ -318,11 +336,31 @@ class AutoTrader:
             self._save_state()
 
     # ------------------------------------------------------------ buys
+    def _held_codes(self) -> set[str]:
+        """보유 중으로 볼 종목: 최신 잔고 + 최근 잔고에 있었던 종목 (일시적 빈 응답 대비)."""
+        return set(self.holdings) | set(self._recent)
+
     def _slots_used(self) -> int:
-        return len(set(self.holdings) | set(self.pending_buys))
+        return len(self._held_codes() | set(self.pending_buys))
+
+    def _elapsed(self, kind: str, code: str, ordered_at: float, wall_now: float) -> float:
+        """주문 후 경과 시간. 이번 실행에서 낸 주문은 단조시계로 잰다 (PC 시계 보정 영향 없음)."""
+        started = self._order_mono.get((kind, code))
+        if started is not None:
+            return self._mono() - started
+        return wall_now - ordered_at
+
+    def _sell_retry_delay(self, code: str) -> float:
+        """매도 재판단 간격: 기본 SELL_RETRY_SEC, 거부가 반복되면 2배씩 늘려 최대 5분."""
+        n = self._sell_rejects.get(code, 0)
+        delay = self._s.sell_retry_sec * (2 ** max(n - 1, 0))
+        return min(delay, max(SELL_REJECT_BACKOFF_MAX_SEC, self._s.sell_retry_sec))
 
     def _process_signals(self) -> None:
+        deadline = self._mono() + SIGNAL_TIME_BUDGET_SEC
         for _ in range(MAX_SIGNALS_PER_STEP):
+            if self._mono() > deadline:
+                return
             try:
                 sig = self._signals.get_nowait()
             except queue.Empty:
@@ -341,7 +379,8 @@ class AutoTrader:
         if not in_buy_window(self._now(), self._s.buy_start, self._s.buy_end):
             log.info("매수 시간 외 신호 무시: %s", tag)
             return
-        if code in self.holdings or code in self.pending_buys or code in self.pending_sells:
+        if (code in self._held_codes() or code in self.pending_buys or code in self.pending_sells
+                or code in self.managed):
             log.info("이미 보유/주문 중인 종목이라 건너뜀: %s", tag)
             return
         if not self._s.rebuy_same_day and (code in self.bought_today or code in self.sold_today):
@@ -386,6 +425,7 @@ class AutoTrader:
         had_managed = code in self.managed
         pb = PendingBuy(code=code, name=sig.name, qty=qty, ord_no=0, ordered_at=self._clock())
         self.pending_buys[code] = pb
+        self._order_mono[("BUY", code)] = self._mono()
         self.managed.add(code)
         self.bought_today.add(code)
         if not self._save_state():
@@ -420,6 +460,7 @@ class AutoTrader:
 
     def _rollback_buy(self, code: str, had_bought_today: bool, had_managed: bool) -> None:
         self.pending_buys.pop(code, None)
+        self._order_mono.pop(("BUY", code), None)
         if not had_bought_today:
             self.bought_today.discard(code)
         if not had_managed and code not in self.holdings:
@@ -462,15 +503,18 @@ class AutoTrader:
             res = self._b.sell_market(h.code, h.sellable_qty)
         except Exception as e:  # noqa: BLE001
             ambiguous = bool(getattr(e, "ambiguous", False))
+            if not ambiguous:  # 거래정지·휴장 등으로 계속 거부되면 재시도 간격을 늘린다
+                self._sell_rejects[h.code] = self._sell_rejects.get(h.code, 0) + 1
             # 바로 재주문하지 않도록 대기 상태로 둔다 (중복 매도 방지 / 거부 반복 방지)
             self.pending_sells[h.code] = PendingSell(code=h.code, name=h.name, qty=h.sellable_qty,
                                                      ord_no=0, reason=reason,
                                                      ordered_at=self._clock(), held_qty=h.qty)
+            self._order_mono[("SELL", h.code)] = self._mono()
             self.sold_today.add(h.code)
             self._save_state()
             log.error("%s 매도 주문 %s: %s %d주 - %s (%.0f초 뒤 잔고를 보고 다시 판단)", label,
                       "결과 불명" if ambiguous else "실패", tag, h.sellable_qty, e,
-                      self._s.sell_retry_sec)
+                      self._sell_retry_delay(h.code))
             self._trades.write(time=self._ts(), mode=self._s.trading_mode, side="SELL", code=h.code,
                                name=h.name, qty=h.sellable_qty, ref_price=price,
                                avg_price=h.avg_price, reason=label,
@@ -479,6 +523,8 @@ class AutoTrader:
         self.pending_sells[h.code] = PendingSell(code=h.code, name=h.name, qty=h.sellable_qty,
                                                  ord_no=res.ord_no, reason=reason,
                                                  ordered_at=self._clock(), held_qty=h.qty)
+        self._order_mono[("SELL", h.code)] = self._mono()
+        self._sell_rejects.pop(h.code, None)
         self.sold_today.add(h.code)
         self._save_state()
         log.info("%s 매도 주문 접수: %s %d주 시장가 (현재가 %d원, 평균단가 %.0f원, %+.2f%%, 주문번호 %d)",

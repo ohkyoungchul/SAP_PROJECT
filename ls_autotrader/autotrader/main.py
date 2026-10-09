@@ -59,8 +59,7 @@ def setup_logging(data_dir: Path) -> None:
     file = logging.FileHandler(log_dir / f"autotrader_{datetime.now():%Y%m%d}.log", encoding="utf-8")
     file.setFormatter(fmt)
     q: "queue.Queue[logging.LogRecord]" = queue.Queue()
-    if _log_listener is not None:
-        _log_listener.stop()
+    shutdown_logging()
     _log_listener = logging.handlers.QueueListener(q, console)
     _log_listener.start()
     root = logging.getLogger()
@@ -68,6 +67,14 @@ def setup_logging(data_dir: Path) -> None:
     root.handlers[:] = [logging.handlers.QueueHandler(q), file]
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("websocket").setLevel(logging.WARNING)
+
+
+def shutdown_logging() -> None:
+    """남은 콘솔 로그를 모두 출력하고 출력 스레드를 멈춘다 (여러 번 불러도 안전)."""
+    global _log_listener
+    if _log_listener is not None:
+        _log_listener.stop()
+        _log_listener = None
 
 
 def disable_quick_edit() -> None:
@@ -178,6 +185,67 @@ def account_fingerprint(appkey: str) -> str:
     return hashlib.sha256(appkey.encode()).hexdigest()[:12]
 
 
+def current_store(settings: Settings) -> StateStore:
+    fp = account_fingerprint(settings.appkey)
+    return StateStore(settings.data_dir / f"state_{settings.trading_mode}_{fp}.json",
+                      identity={"mode": settings.trading_mode, "account": fp})
+
+
+def _state_has_positions(st: dict) -> list[str]:
+    codes = set(st.get("managed") or []) | set(st.get("pending_buys") or {}) | \
+        set(st.get("pending_sells") or {})
+    return sorted(codes)
+
+
+def find_orphan_states(settings: Settings, current: Path) -> list[tuple[Path, list[str]]]:
+    """현재 키로는 읽지 않는 상태 파일 중 봇이 산 종목이 남아 있는 것 (이전 버전의 state.json 포함)."""
+    found = []
+    candidates = [settings.data_dir / "state.json",
+                  *sorted(settings.data_dir.glob(f"state_{settings.trading_mode}_*.json"))]
+    for path in candidates:
+        if path == current or not path.is_file():
+            continue
+        try:
+            st = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            found.append((path, ["(파일을 읽을 수 없음)"]))
+            continue
+        if not isinstance(st, dict):
+            continue
+        ident = st.get("identity") or {}
+        if ident and ident.get("mode") not in (None, settings.trading_mode):
+            continue
+        codes = _state_has_positions(st)
+        if codes:
+            found.append((path, codes))
+    return found
+
+
+def adopt_state(src: Path, store: StateStore) -> int:
+    try:
+        old = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(old, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as e:
+        print(f"상태 파일을 읽을 수 없습니다: {src} ({e})", file=sys.stderr)
+        return 1
+    cur = store.load()
+    merged = dict(cur)
+    merged["managed"] = sorted(set(cur.get("managed") or []) | set(old.get("managed") or []))
+    for key in ("pending_buys", "pending_sells"):
+        merged[key] = {**(old.get(key) or {}), **(cur.get(key) or {})}
+    if old.get("date") == cur.get("date") or not cur.get("date"):
+        merged["date"] = old.get("date") or cur.get("date", "")
+        for key in ("bought_today", "sold_today"):
+            merged[key] = sorted(set(cur.get(key) or []) | set(old.get(key) or []))
+    store.save(merged)
+    done = src.with_name(src.name + ".adopted")
+    os.replace(src, done)
+    print(f"{src.name} 의 종목 {', '.join(_state_has_positions(old)) or '(없음)'} 을(를) "
+          f"{store.path.name} 로 가져왔습니다. 원본은 {done.name} 으로 이름을 바꿨습니다.")
+    return 0
+
+
 def check_trading_environment(account: Account, settings: Settings) -> bool:
     """모의투자로 설정했는데 실전 키를 넣은 경우(또는 그 반대)를 막는다."""
     cash, msg = account.account_summary()
@@ -202,6 +270,8 @@ def main(argv: list[str] | None = None, stop_event: threading.Event | None = Non
     parser.add_argument("--env", default=".env", help=".env 파일 경로 (기본: .env)")
     parser.add_argument("--list-conditions", action="store_true",
                         help="서버에 저장된 조건식 목록만 출력하고 종료")
+    parser.add_argument("--adopt-state", metavar="파일",
+                        help="이전 버전/다른 키의 상태 파일에 있는 '봇이 산 종목'을 현재 상태 파일로 가져오고 종료")
     args = parser.parse_args(argv)
 
     try:
@@ -216,9 +286,12 @@ def main(argv: list[str] | None = None, stop_event: threading.Event | None = Non
         print(f"이미 같은 데이터 폴더({settings.data_dir})로 실행 중인 자동매매가 있습니다.", file=sys.stderr)
         return 2
     try:
+        if args.adopt_state:
+            return adopt_state(Path(args.adopt_state), current_store(settings))
         return _run(args, settings, stop_event or threading.Event())
     finally:
         lock.release()
+        shutdown_logging()
 
 
 def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Event) -> int:
@@ -279,9 +352,18 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
              settings.buy_end.strftime("%H:%M"))
     log.info("=" * 64)
 
-    fp = account_fingerprint(settings.appkey)
-    store = StateStore(settings.data_dir / f"state_{settings.trading_mode}_{fp}.json",
-                       identity={"mode": settings.trading_mode, "account": fp})
+    store = current_store(settings)
+    orphans = find_orphan_states(settings, store.path)
+    if orphans:
+        for path, codes in orphans:
+            log.error("현재 키로 읽지 않는 상태 파일에 봇이 산 종목이 남아 있습니다: %s → %s",
+                      path.name, ", ".join(codes))
+        log.error("이 종목들의 익절/손절 감시가 끊기지 않도록 실행을 멈춥니다.\n"
+                  "  - 같은 계좌(이전 버전 실행, App Key 재발급 등)라면: "
+                  "python -m autotrader --adopt-state \"%s\" 로 가져온 뒤 다시 실행하세요.\n"
+                  "  - 다른 계좌이거나 이미 직접 정리한 종목이라면: 그 파일을 다른 폴더로 옮기거나 삭제하세요.",
+                  orphans[0][0])
+        return 1
     trades = TradeLog(settings.data_dir / "trades.csv")
     try:
         trader = AutoTrader(broker, settings, store=store, trade_log=trades)
@@ -319,8 +401,8 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
         log.info("조건검색 신호: %s %s 구분=%s 가격=%s", sig.code, sig.name, sig.job_flag, sig.price)
         trader.on_signal(sig)
 
-    def on_ack(tr_cd: str, tr_key: str, rsp_cd: str, rsp_msg: str) -> None:
-        if tr_cd != "AFR":
+    def on_ack(tr_cd: str, tr_key: str, tr_type: str, rsp_cd: str, rsp_msg: str) -> None:
+        if tr_cd != "AFR" or tr_type == "4":  # 해제 요청의 응답은 무시
             return
         acks[(tr_cd, tr_key)] = (rsp_cd, rsp_msg)
         ack_event.set()
@@ -408,6 +490,8 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
                     log.info("접근토큰이 바뀌어 WebSocket 을 다시 연결합니다.")
                     ws.reconnect()  # 재접속되면 on_reconnect → 재등록
                 if reregister.is_set() and now >= next_reregister:
+                    reregister.clear()  # 시도 전에 내린다: 시도 중 도착한 거부 응답이 다시 올리도록
+                    next_reregister = now + REREGISTER_RETRY_SEC
                     try:
                         new_num = market.register_realtime_condition(condition.query_index)
                         ws.replace_subscription("AFR", alert_num, new_num)
@@ -419,11 +503,10 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
                         log.info("실시간 조건검색 재등록 (실시간키 %s → %s)", alert_num, new_num)
                         alert_num = new_num
                         registry.save(condition.query_index, alert_num)
-                        reregister.clear()
                     except LsApiError as e:
                         log.error("실시간 조건검색 재등록 실패 (%.0f초 후 재시도): %s",
                                   REREGISTER_RETRY_SEC, e)
-                        next_reregister = now + REREGISTER_RETRY_SEC
+                        reregister.set()
                 trader.step()
             except Exception:  # noqa: BLE001 - 어떤 오류가 나도 감시는 계속
                 log.exception("메인 루프 오류")
@@ -437,8 +520,6 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
         cleanup_registration(alert_num)
         ws.stop()
         log.info("자동매매 종료. 보유 종목의 익절/손절 감시도 멈췄습니다.")
-        if _log_listener is not None:
-            _log_listener.stop()
     return 0
 
 

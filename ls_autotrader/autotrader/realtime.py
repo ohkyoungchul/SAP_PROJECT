@@ -34,7 +34,7 @@ class RealtimeClient:
     def __init__(self, url: str, token_provider: Callable[[], str],
                  on_data: Callable[[str, str, dict], None],
                  on_reconnect: Callable[[], None] | None = None,
-                 on_ack: Callable[[str, str, str, str], None] | None = None) -> None:
+                 on_ack: Callable[[str, str, str, str, str], None] | None = None) -> None:
         self._url = url
         self._token = token_provider
         self._on_data = on_data
@@ -170,7 +170,8 @@ class RealtimeClient:
             log.log(level, "실시간 응답 %s %s: %s %s", tr_cd, tr_key, rsp_cd, rsp_msg)
             if self._on_ack is not None:
                 try:
-                    self._on_ack(tr_cd, tr_key, str(rsp_cd), str(rsp_msg or ""))
+                    self._on_ack(tr_cd, tr_key, str(header.get("tr_type") or ""), str(rsp_cd),
+                                 str(rsp_msg or ""))
                 except Exception:  # noqa: BLE001
                     log.exception("실시간 응답 처리 오류")
             return

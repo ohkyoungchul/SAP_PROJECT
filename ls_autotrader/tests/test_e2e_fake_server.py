@@ -345,3 +345,73 @@ def test_state_file_is_per_mode_and_account(tmp_path, monkeypatch):
     """TL-2/MS-2: 상태 파일 이름에 모드와 계좌 지문이 들어간다."""
     fp = main_mod.account_fingerprint("k")
     assert len(fp) == 12 and fp != main_mod.account_fingerprint("k2")
+
+
+def test_legacy_state_blocks_start_until_adopted(tmp_path, monkeypatch):
+    """V2-TR-4/F3: 이전 버전 state.json 에 봇 종목이 있으면 조용히 버리지 않는다."""
+    fake = FakeLs()
+    http = start_http(fake)
+    _base_env(monkeypatch, tmp_path, http)
+    (tmp_path / "state.json").write_text(json.dumps(
+        {"date": "2026-10-08", "managed": ["005930"], "pending_buys": {}, "pending_sells": {}}),
+        encoding="utf-8")
+    try:
+        assert main_mod.main(["--env", str(tmp_path / "none.env")]) == 1
+        assert main_mod.main(["--env", str(tmp_path / "none.env"),
+                              "--adopt-state", str(tmp_path / "state.json")]) == 0
+    finally:
+        http.shutdown()
+    assert (tmp_path / "state.json.adopted").exists()
+    fp = main_mod.account_fingerprint("k")
+    st = json.loads((tmp_path / f"state_paper_{fp}.json").read_text(encoding="utf-8"))
+    assert st["managed"] == ["005930"] and st["identity"] == {"mode": "paper", "account": fp}
+
+
+def test_runtime_afr_rejection_keeps_retrying(tmp_path, monkeypatch):
+    """N1/F1: 재등록한 구독이 또 거부돼도 재시도를 멈추지 않는다."""
+    fake = FakeLs()
+    counter = {"n": 0}
+    reject = set()
+    orig = fake.handle
+
+    def handle(path, headers, body):
+        if headers.get("tr_cd") == "t1860" and body["t1860InBlock"]["sFlag"] == "E":
+            with fake.lock:
+                fake.t1860.append(body["t1860InBlock"])
+                counter["n"] += 1
+                return 200, {"t1860OutBlock": {"sAlertNum": f"A{counter['n']}"}, "rsp_cd": "00000"}
+        return orig(path, headers, body)
+
+    async def ws_handler(conn):
+        fake.ws_conns.append(conn)
+        async for raw in conn:
+            msg = json.loads(raw)
+            fake.ws_msgs.append(msg)
+            key = msg["body"]["tr_key"]
+            bad = msg["header"]["tr_type"] == "3" and key in reject
+            await conn.send(json.dumps({"header": {
+                "tr_cd": "AFR", "tr_key": key, "tr_type": msg["header"]["tr_type"],
+                "rsp_cd": "99999" if bad else "00000", "rsp_msg": "거부" if bad else "정상"},
+                "body": None}))
+
+    fake.handle = handle
+    fake.ws_handler = ws_handler
+    http = start_http(fake)
+    ws_port = start_ws(fake)
+    _base_env(monkeypatch, tmp_path, http, ws_port)
+    monkeypatch.setattr(main_mod, "REREGISTER_RETRY_SEC", 1.0)
+    stop = threading.Event()
+    t = threading.Thread(target=lambda: main_mod.main(["--env", str(tmp_path / "none.env")],
+                                                      stop_event=stop), daemon=True)
+    t.start()
+    try:
+        assert wait_until(lambda: counter["n"] == 1 and len(fake.ws_msgs) >= 1)
+        reject.update({"A1", "A2"})  # 현재 키와 다음 키 모두 거부
+        asyncio.run_coroutine_threadsafe(fake.ws_conns[0].close(), fake.loop)
+        assert wait_until(lambda: counter["n"] >= 3, timeout=25), f"재시도 멈춤 (E 호출 {counter['n']}회)"
+        assert wait_until(lambda: any(m["body"]["tr_key"] == "A3" and m["header"]["tr_type"] == "3"
+                                      for m in fake.ws_msgs), timeout=10)
+    finally:
+        stop.set()
+        t.join(10)
+        http.shutdown()

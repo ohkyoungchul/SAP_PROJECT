@@ -629,3 +629,59 @@ def test_exits_checked_before_signal_backlog(env):
     assert quote_calls[0] == ["000001"]
     assert ("SELL", "000001", 10) in broker.orders
     assert len(quote_calls) <= 1 + 3
+
+
+def test_single_empty_snapshot_does_not_free_slots_or_allow_rebuy(env, make_settings):
+    """V2-TR-1: 잔고가 한 번 비어 와도 슬롯/보유 판단은 최근 잔고 기준."""
+    broker, clock, trader = env(make_settings(max_positions=2, rebuy_same_day=True))
+    broker.holdings["005930"] = Holding("005930", "사용자보유", 100, 100, 8_000.0, 8_000)
+    broker.prices.update({"005930": 8_000, "000001": 5_000, "000003": 5_000})
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    real = broker.get_holdings
+    broker.get_holdings = lambda: []
+    clock.advance(3)
+    trader.reconcile()
+    broker.get_holdings = real
+    trader.on_signal(sig("005930"))
+    trader.on_signal(sig("000001", flag="R"))
+    trader.on_signal(sig("000003"))
+    trader.step()
+    assert [o for o in broker.orders if o[0] == "BUY"] == [("BUY", "000001", 20)]
+
+
+def test_overnight_empty_snapshots_do_not_drop_positions(env):
+    """V2-TR-2: 장 시간 외 빈 응답이 여러 번 와도 관리 종목을 잃지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    clock.dt = datetime(2026, 10, 8, 23, 0)
+    real = broker.get_holdings
+    broker.get_holdings = lambda: []
+    run(trader, clock, seconds=30)
+    broker.get_holdings = real
+    assert "000001" in trader.managed
+    clock.dt = datetime(2026, 10, 9, 9, 0, 5)
+    broker.prices["000001"] = 9_000
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_repeated_sell_rejections_back_off(env, make_settings):
+    """V2-TR-3: 거래정지/휴장으로 매도가 계속 거부되면 재시도 간격이 늘어난다."""
+    broker, clock, trader = env(make_settings(sell_retry_sec=10.0))
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    calls = []
+
+    def reject(code, qty):
+        calls.append(clock.m)
+        raise RuntimeError("매매거래정지 종목")
+
+    broker.sell_market = reject
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=200)
+    gaps = [b - a for a, b in zip(calls, calls[1:])]
+    assert gaps[0] < gaps[-1] and len(calls) <= 6

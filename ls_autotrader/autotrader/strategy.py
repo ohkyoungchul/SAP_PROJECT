@@ -10,6 +10,8 @@ STOP_LOSS = "STOP_LOSS"
 # 정규장 시장가 주문을 보낼 수 있는 시간 (장 마감 동시호가 15:20~15:30 포함)
 SELL_START = time(9, 0)
 SELL_END = time(15, 30)
+# 매도 완료/보유 종목 사라짐을 확정할 수 있는 마지막 시각 (마감 동시호가 체결이 잔고에 반영될 여유)
+PRUNE_END = time(15, 45)
 
 
 def calc_buy_qty(amount: int, price: int) -> int:

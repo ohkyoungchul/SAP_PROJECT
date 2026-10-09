@@ -101,3 +101,20 @@ def test_env_file_cp949_gives_config_error(tmp_path):
     p.write_bytes("CONDITION_NAME=떡상이\n".encode("cp949"))
     with pytest.raises(ConfigError):
         load_env_file(p)
+
+
+def test_env_duplicate_conflicting_keys_rejected(tmp_path, monkeypatch):
+    """V2-CFG-1: 같은 키가 다른 값으로 두 번 있으면 조용히 첫 값을 쓰지 않는다."""
+    monkeypatch.delenv("TRADING_MODE", raising=False)
+    p = tmp_path / ".env"
+    p.write_text("TRADING_MODE=real\nDRY_RUN=true\nTRADING_MODE=paper\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_env_file(p)
+
+
+def test_env_empty_template_line_filled_by_later_value(tmp_path, monkeypatch):
+    monkeypatch.delenv("LS_APPKEY", raising=False)
+    p = tmp_path / ".env"
+    p.write_text("LS_APPKEY=\n# ...\nLS_APPKEY=abc\n", encoding="utf-8")
+    load_env_file(p)
+    assert os.environ["LS_APPKEY"] == "abc"
