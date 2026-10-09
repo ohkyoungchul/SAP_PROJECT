@@ -331,3 +331,94 @@ def test_rate_limiter_spacing():
     assert slept == [0.5]
     lim.wait("t8407", 5)
     assert slept[-1] == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------- 리뷰 지적 회귀 테스트
+def test_t0424_error_body_raises_instead_of_empty(api):
+    """CONF-1: HTTP 200 오류 응답을 '보유 없음'으로 읽지 않는다."""
+    session, _, _, account = api
+    session.queue("t0424", FakeResp(200, {"rsp_cd": "02001", "rsp_msg": "조회중 오류"}))
+    with pytest.raises(LsApiError):
+        account.get_holdings()
+    session.queue("t0424", FakeResp(200, None))  # JSON 아님
+    with pytest.raises(LsApiError):
+        account.get_holdings()
+
+
+def test_t0424_empty_account_ok(api):
+    session, _, _, account = api
+    session.queue("t0424", FakeResp(200, {"rsp_cd": "00000", "rsp_msg": "조회완료"}))
+    assert account.get_holdings() == []
+    session.queue("t0424", FakeResp(200, {"rsp_cd": "00200", "rsp_msg": "조회내역이 없습니다."}))
+    assert account.get_holdings() == []
+
+
+def test_token_issued_just_before_0700_refreshes_once_after():
+    """CONF-5/CR-6: 07:00 직전에는 재발급을 반복하지 않는다."""
+    session = FakeSession()
+    clock = {"now": datetime(2026, 10, 9, 6, 56, tzinfo=KST)}
+    client = make_client(session, now=lambda: clock["now"])
+    assert client.token == "tok1"
+    for minute, sec in ((57, 0), (58, 30), (59, 50), (0, 2)):
+        clock["now"] = datetime(2026, 10, 9, 6 if minute else 7, minute, sec, tzinfo=KST)
+        _ = client.token
+    assert session.token_count == 1
+    clock["now"] = datetime(2026, 10, 9, 7, 0, 6, tzinfo=KST)
+    assert client.token == "tok2"
+    assert session.token_count == 2
+
+
+def test_same_token_does_not_bump_version():
+    class SameToken(FakeSession):
+        def post(self, url, **kw):
+            r = super().post(url, **kw)
+            if url.endswith("/oauth2/token"):
+                r._body["access_token"] = "SAME"
+            return r
+
+    session = SameToken()
+    client = make_client(session)
+    _ = client.token
+    v = client.token_version
+    client.invalidate_token()
+    assert client.token == "SAME"
+    assert client.token_version == v
+
+
+def test_t1866_stuck_paging_stops_and_dedupes(api):
+    """CONF-6: 같은 연속키가 반복되면 멈추고 중복을 제거한다."""
+    session, _, market, _ = api
+    page = {"t1866OutBlock": {"cont": "1", "contkey": "SAME"},
+            "t1866OutBlock1": [{"query_index": "tester  0003", "group_name": "g", "query_name": "떡상이"}]}
+    session.queue("t1866", *[FakeResp(200, page, headers={"tr_cont": "Y", "tr_cont_key": "HK"})
+                             for _ in range(5)])
+    conds = market.list_conditions()
+    assert [c.query_name for c in conds] == ["떡상이"]
+    calls = [c for c in session.calls if c["headers"].get("tr_cd") == "t1866"]
+    assert len(calls) == 2
+    assert calls[1]["headers"]["tr_cont"] == "Y" and calls[1]["headers"]["tr_cont_key"] == "HK"
+
+
+def test_query_uses_short_timeout_order_uses_long(settings):
+    seen = []
+
+    class S(FakeSession):
+        def post(self, url, headers=None, data=None, json=None, timeout=None):
+            if headers and "tr_cd" in headers:
+                seen.append((headers["tr_cd"], timeout))
+            return super().post(url, headers=headers, data=data, json=json, timeout=timeout)
+
+    session = S()
+    client = make_client(session)
+    session.queue("t8407", FakeResp(200, {"t8407OutBlock1": []}))
+    session.queue("CSPAT00601", FakeResp(200, {"CSPAT00601OutBlock2": {"OrdNo": 1}}))
+    MarketData(client, "u").get_quotes(["005930"])
+    Account(client).buy_market("005930", 1)
+    assert seen == [("t8407", 5.0), ("CSPAT00601", 10.0)]
+
+
+def test_account_summary(api):
+    session, _, _, account = api
+    session.queue("CSPAQ12200", FakeResp(200, {"rsp_cd": "00136", "rsp_msg": "모의투자 조회가 완료되었습니다.",
+                                               "CSPAQ12200OutBlock2": {"MnyOrdAbleAmt": 5_000_000}}))
+    assert account.account_summary() == (5_000_000, "모의투자 조회가 완료되었습니다.")

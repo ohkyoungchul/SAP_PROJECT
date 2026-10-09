@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 REAL_CONFIRM_PHRASE = "I_UNDERSTAND_REAL_MONEY"
 
@@ -24,7 +25,12 @@ def load_env_file(path: Path) -> None:
     """
     if not path.is_file():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    try:
+        # utf-8-sig: 메모장이 붙이는 BOM 제거 (없으면 첫 줄 키 이름이 깨진다)
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"{path} 를 UTF-8 로 저장해 주세요 (메모장: 다른 이름으로 저장 → 인코딩 UTF-8).") from e
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -160,17 +166,36 @@ class Settings:
         flags = frozenset(
             f.strip().upper() for f in _get("BUY_JOB_FLAGS", "N,R").split(",") if f.strip()
         )
+        appkey = _get("LS_APPKEY")
+        if data_appkey and data_appkey == appkey:
+            raise ConfigError("LS_DATA_APPKEY 는 LS_APPKEY 와 다른 (실전) 키여야 합니다.")
+        skip_env_check = _get_bool("SKIP_ENV_CHECK", False)
+        if skip_env_check and _get("REAL_TRADING_CONFIRM", "") != REAL_CONFIRM_PHRASE:
+            raise ConfigError(
+                "SKIP_ENV_CHECK=true 는 모의투자/실전 키 확인을 끄는 설정이라, 실수로 실전 키를 쓰면 "
+                "실제 돈으로 주문됩니다. 정말 필요하면 REAL_TRADING_CONFIRM="
+                f"{REAL_CONFIRM_PHRASE} 도 함께 넣어야 합니다."
+            )
+        ws_url = _get("LS_WS_URL", default_ws)
+        parsed = urlparse(ws_url)
+        if parsed.hostname == "openapi.ls-sec.co.kr":
+            want = 9443 if (mode == "real" or data_appkey) else 29443
+            if parsed.port != want:
+                raise ConfigError(
+                    f"LS_WS_URL={ws_url} 의 포트가 맞지 않습니다. 조건검색에 쓰는 키가 "
+                    f"{'실전' if want == 9443 else '모의투자'} 키이므로 {want} 이어야 합니다 "
+                    "(다른 서버의 토큰으로 접속하면 오류 없이 데이터만 오지 않습니다).")
 
         s = cls(
-            appkey=_get("LS_APPKEY"),
+            appkey=appkey,
             appsecret=_get("LS_APPSECRET"),
             user_id=_get("LS_USER_ID"),
             condition_name=condition_name,
             condition_index=condition_index,
             trading_mode=mode,
             rest_base=_get("LS_REST_BASE", "https://openapi.ls-sec.co.kr:8080").rstrip("/"),
-            ws_url=_get("LS_WS_URL", default_ws),
-            dry_run=_get_bool("DRY_RUN", False),
+            ws_url=ws_url,
+            dry_run=_get_bool("DRY_RUN", True),
             buy_amount=_get_int("BUY_AMOUNT", 100_000),
             max_positions=_get_int("MAX_POSITIONS", 10),
             take_profit_pct=_get_float("TAKE_PROFIT_PCT", 10.0),
@@ -189,7 +214,7 @@ class Settings:
             mac_address=_get("LS_MAC_ADDRESS", ""),
             data_appkey=data_appkey,
             data_appsecret=data_appsecret,
-            skip_env_check=_get_bool("SKIP_ENV_CHECK", False),
+            skip_env_check=skip_env_check,
         )
         s.validate()
         return s
@@ -205,8 +230,11 @@ class Settings:
             raise ConfigError("STOP_LOSS_PCT 는 0~100 사이의 양수여야 합니다. (예: 3 → -3%)")
         if self.buy_start >= self.buy_end:
             raise ConfigError("BUY_START 는 BUY_END 보다 빨라야 합니다.")
-        if not self.buy_job_flags:
-            raise ConfigError("BUY_JOB_FLAGS 가 비어 있습니다.")
+        if not self.buy_job_flags or not self.buy_job_flags <= {"N", "R"}:
+            raise ConfigError("BUY_JOB_FLAGS 는 N(진입), R(재진입) 중에서 쉼표로 구분해 지정합니다. 예: N,R "
+                              f"(현재: {','.join(sorted(self.buy_job_flags)) or '비어 있음'})")
+        if self.buy_fill_timeout_sec <= 0 or self.sell_retry_sec <= 0:
+            raise ConfigError("BUY_FILL_TIMEOUT_SEC, SELL_RETRY_SEC 는 0보다 커야 합니다.")
         if self.price_poll_sec < 0.5 or self.balance_poll_sec < 1.0:
             raise ConfigError("PRICE_POLL_SEC 는 0.5초 이상, BALANCE_POLL_SEC 는 1초 이상이어야 합니다 "
                               "(LS 초당 호출 한도: t8407 5회, t0424 2회).")

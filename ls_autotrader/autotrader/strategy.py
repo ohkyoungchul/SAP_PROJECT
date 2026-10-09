@@ -7,6 +7,10 @@ from decimal import Decimal
 TAKE_PROFIT = "TAKE_PROFIT"
 STOP_LOSS = "STOP_LOSS"
 
+# 정규장 시장가 주문을 보낼 수 있는 시간 (장 마감 동시호가 15:20~15:30 포함)
+SELL_START = time(9, 0)
+SELL_END = time(15, 30)
+
 
 def calc_buy_qty(amount: int, price: int) -> int:
     """1회 주문 금액 안에서 살 수 있는 최대 수량 (단가가 금액보다 크면 0)."""
@@ -46,3 +50,8 @@ def in_buy_window(now: datetime, start: time, end: time) -> bool:
         return False
     t = now.time()
     return start <= t < end
+
+
+def in_sell_window(now: datetime) -> bool:
+    """익절/손절 시장가 주문을 보낼 시간 (평일 09:00 <= 현재 < 15:30)."""
+    return in_buy_window(now, SELL_START, SELL_END)

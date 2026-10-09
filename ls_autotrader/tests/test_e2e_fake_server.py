@@ -176,6 +176,7 @@ def test_full_flow(tmp_path, monkeypatch):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(trader_mod, "in_buy_window", lambda *a: True)  # 시험 시각과 무관하게
+    monkeypatch.setattr(trader_mod, "in_sell_window", lambda *a: True)
 
     stop = threading.Event()
     result = {}
@@ -262,7 +263,7 @@ def test_websocket_reconnect_resubscribes(tmp_path, monkeypatch):
     try:
         assert wait_until(lambda: len(fake.ws_conns) == 1 and fake.ws_msgs)
         conn = fake.ws_conns[0]
-        asyncio.run_coroutine_threadsafe(conn.close(), fake.loop).result(5)
+        asyncio.run_coroutine_threadsafe(conn.close(), fake.loop)  # 서버가 연결을 끊음
         assert wait_until(lambda: len(fake.ws_conns) == 2, timeout=15), "재접속 안 됨"
         assert wait_until(lambda: sum(1 for b in fake.t1860 if b["sFlag"] == "E") >= 2, timeout=15)
         n_afr = sum(1 for m in fake.ws_msgs
@@ -272,3 +273,75 @@ def test_websocket_reconnect_resubscribes(tmp_path, monkeypatch):
         stop.set()
         t.join(10)
         http.shutdown()
+
+
+def _base_env(monkeypatch, tmp_path, http, ws_port=9, **extra):
+    for k in list(os.environ):
+        if k.startswith("LS_") or k in ("CONDITION_NAME", "CONDITION_INDEX", "TRADING_MODE",
+                                        "SKIP_ENV_CHECK", "REAL_TRADING_CONFIRM", "DRY_RUN"):
+            monkeypatch.delenv(k, raising=False)
+    env = {"LS_APPKEY": "k", "LS_APPSECRET": "s", "LS_USER_ID": "tester",
+           "CONDITION_NAME": "떡상이", "TRADING_MODE": "paper",
+           "LS_REST_BASE": f"http://127.0.0.1:{http.server_address[1]}",
+           "LS_WS_URL": f"ws://127.0.0.1:{ws_port}/websocket", "DATA_DIR": str(tmp_path), **extra}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+
+def test_afr_rejected_exits_with_help(tmp_path, monkeypatch, caplog):
+    """CONF-2: AFR 구독이 거부되면 조용히 돌지 않고 안내 후 종료 + 등록 해제."""
+    fake = FakeLs()
+
+    async def reject(conn):
+        fake.ws_conns.append(conn)
+        async for raw in conn:
+            msg = json.loads(raw)
+            fake.ws_msgs.append(msg)
+            await conn.send(json.dumps({"header": {
+                "tr_cd": msg["body"]["tr_cd"], "tr_key": msg["body"]["tr_key"],
+                "rsp_cd": "01900", "rsp_msg": "모의투자에서는 해당업무가 제공되지 않습니다."},
+                "body": None}))
+
+    fake.ws_handler = reject
+    http = start_http(fake)
+    ws_port = start_ws(fake)
+    _base_env(monkeypatch, tmp_path, http, ws_port)
+    try:
+        rc = main_mod.main(["--env", str(tmp_path / "none.env")])
+    finally:
+        http.shutdown()
+    assert rc == 1
+    assert fake.t1860[-1]["sFlag"] == "D"
+    assert fake.orders == []
+
+
+def test_second_instance_refused(tmp_path, monkeypatch):
+    """CR-12: 같은 데이터 폴더로 두 번 실행되지 않는다."""
+    fake = FakeLs()
+    http = start_http(fake)
+    _base_env(monkeypatch, tmp_path, http)
+    lock = main_mod.InstanceLock(tmp_path / "autotrader.lock")
+    assert lock.acquire()
+    try:
+        assert main_mod.main(["--env", str(tmp_path / "none.env")]) == 2
+    finally:
+        lock.release()
+        http.shutdown()
+
+
+def test_skip_env_check_requires_confirm_phrase(tmp_path, monkeypatch):
+    """MS-1: SKIP_ENV_CHECK 만으로는 키 확인을 우회할 수 없다."""
+    fake = FakeLs()
+    http = start_http(fake)
+    _base_env(monkeypatch, tmp_path, http, SKIP_ENV_CHECK="true")
+    try:
+        assert main_mod.main(["--env", str(tmp_path / "none.env")]) == 2  # 설정 오류
+    finally:
+        http.shutdown()
+    assert fake.orders == []
+
+
+def test_state_file_is_per_mode_and_account(tmp_path, monkeypatch):
+    """TL-2/MS-2: 상태 파일 이름에 모드와 계좌 지문이 들어간다."""
+    fp = main_mod.account_fingerprint("k")
+    assert len(fp) == 12 and fp != main_mod.account_fingerprint("k2")

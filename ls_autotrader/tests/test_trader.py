@@ -63,12 +63,18 @@ class FakeBroker:
 
 
 class Clock:
+    """벽시계(t)와 단조시계(m)를 따로 둔다. 기본은 함께 움직인다."""
+
     def __init__(self) -> None:
         self.t = 1_000_000.0
+        self.m = 500.0
         self.dt = datetime(2026, 10, 8, 10, 0, 0)  # 목요일 장중
 
     def __call__(self) -> float:
         return self.t
+
+    def mono(self) -> float:
+        return self.m
 
     def now(self) -> datetime:
         return self.dt
@@ -76,7 +82,14 @@ class Clock:
     def advance(self, sec: float) -> None:
         from datetime import timedelta
         self.t += sec
+        self.m += sec
         self.dt += timedelta(seconds=sec)
+
+
+def make_trader(broker, clock, settings, tmp_path, store=None, trade_log=None):
+    return AutoTrader(broker, settings, store=store or StateStore(tmp_path / "state.json"),
+                      trade_log=trade_log or TradeLog(tmp_path / "trades.csv"), clock=clock,
+                      mono=clock.mono, now=clock.now)
 
 
 @pytest.fixture
@@ -84,9 +97,7 @@ def env(settings, tmp_path):
     def _make(s=None):
         broker = FakeBroker()
         clock = Clock()
-        trader = AutoTrader(broker, s or settings, store=StateStore(tmp_path / "state.json"),
-                            trade_log=TradeLog(tmp_path / "trades.csv"), clock=clock,
-                            now=clock.now)
+        trader = make_trader(broker, clock, s or settings, tmp_path)
         return broker, clock, trader
     return _make
 
@@ -135,7 +146,7 @@ def test_take_profit_and_stop_loss(env):
 
     broker.prices["000001"] = 11_000  # +10% → 익절
     broker.prices["000002"] = 9_700   # -3% → 손절
-    run(trader, clock)
+    run(trader, clock, seconds=12)  # 잔고에서 연속 3회 안 보여야 매도 완료로 확정
     assert ("SELL", "000001", 10) in broker.orders
     assert ("SELL", "000002", 10) in broker.orders
     assert trader.holdings == {}
@@ -224,7 +235,7 @@ def test_rebuy_same_day_allowed(env, make_settings):
     trader.on_signal(sig("000001"))
     run(trader, clock)
     broker.prices["000001"] = 9_000
-    run(trader, clock)
+    run(trader, clock, seconds=12)
     broker.prices["000001"] = 9_500
     trader.on_signal(sig("000001", flag="R"))
     run(trader, clock)
@@ -286,8 +297,7 @@ def test_state_survives_restart(env, settings, tmp_path):
     run(trader, clock)
 
     # 재시작: 같은 상태 파일, 같은 계좌
-    trader2 = AutoTrader(broker, settings, store=StateStore(tmp_path / "state.json"),
-                         trade_log=TradeLog(tmp_path / "trades.csv"), clock=clock, now=clock.now)
+    trader2 = make_trader(broker, clock, settings, tmp_path)
     assert "000001" in trader2.managed
     trader2.on_signal(sig("000001", flag="R"))  # 당일 재매수 금지 유지
     broker.prices["000001"] = 9_000
@@ -296,12 +306,13 @@ def test_state_survives_restart(env, settings, tmp_path):
 
 
 def test_late_fill_still_managed(env, make_settings):
+    """체결이 늦어도(VI 등) 주문 중으로 유지하고, 뒤늦게 체결되면 익절/손절 대상이 된다."""
     broker, clock, trader = env(make_settings(buy_fill_timeout_sec=5.0))
     broker.fill_immediately = False
     broker.prices["000001"] = 10_000
     trader.on_signal(sig("000001"))
-    run(trader, clock, seconds=10)  # 타임아웃 경과
-    assert "000001" not in trader.pending_buys
+    run(trader, clock, seconds=10)  # 경고 시간 경과
+    assert "000001" in trader.pending_buys and trader.pending_buys["000001"].delay_warned
     broker.apply_fills()  # 뒤늦게 체결
     broker.fill_immediately = True
     broker.prices["000001"] = 9_000
@@ -397,3 +408,224 @@ def test_invalid_signal_code_ignored(env):
     trader.on_signal(sig("\x007720"))
     run(trader, clock)
     assert broker.orders == []
+
+
+# ---------------------------------------------------------------- 리뷰 지적 회귀 테스트
+def test_one_empty_snapshot_does_not_drop_managed(env):
+    """TL-1: 잔고 조회가 한 번 비어 와도 관리 종목/매도대기를 버리지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    real = broker.get_holdings
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else real()
+
+    broker.get_holdings = flaky
+    run(trader, clock, seconds=8)
+    assert "000001" in trader.managed
+    broker.prices["000001"] = 9_000
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_state_of_other_mode_is_ignored(settings, tmp_path):
+    """TL-2: 모의투자 상태 파일을 실전 계좌가 읽지 않는다."""
+    paper = StateStore(tmp_path / "s.json", identity={"mode": "paper", "account": "a"})
+    paper.save({"managed": ["005930"]})
+    real = StateStore(tmp_path / "s.json", identity={"mode": "real", "account": "b"})
+    assert real.load() == {}
+    assert paper.load()["managed"] == ["005930"]
+
+
+def test_slow_fill_keeps_slot_and_blocks_duplicate(env, make_settings):
+    """TL-3/MS-3: VI 등으로 체결이 늦어도 슬롯을 계속 차지하고 같은 종목을 다시 사지 않는다."""
+    broker, clock, trader = env(make_settings(max_positions=2, rebuy_same_day=True,
+                                              buy_fill_timeout_sec=5.0))
+    broker.fill_immediately = False
+    for code in ("000001", "000002"):
+        broker.prices[code] = 5_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock, seconds=70)  # 경고 시간 훨씬 경과
+    trader.on_signal(sig("000001", flag="R"))
+    trader.on_signal(sig("000002"))
+    trader.on_signal(sig("000003"))
+    broker.prices["000003"] = 5_000
+    run(trader, clock)
+    assert [o[1] for o in broker.orders if o[0] == "BUY"] == ["000001", "000002"]
+
+
+def test_no_rebuy_after_overnight_stop_loss(env, settings, tmp_path):
+    """TL-4: 전날 산 종목을 오늘 손절했으면 오늘은 다시 사지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    clock.advance(24 * 3600)  # 다음 날
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=12)
+    trader.on_signal(sig("000001", flag="R"))
+    run(trader, clock)
+    assert [o[0] for o in broker.orders] == ["BUY", "SELL"]
+
+
+def test_partial_fill_remainder_sold(env):
+    """TL-5: 매도 주문 이후 남은 매수 수량이 체결되면 바로 다시 매도한다."""
+    broker, clock, trader = env()
+    broker.fill_immediately = False
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    trader.step()
+    broker._fills.clear()
+    broker.holdings["000001"] = Holding("000001", "종목000001", 3, 3, 10_000.0, 10_000)  # 3/10 체결
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=3)
+    assert broker.orders[-1] == ("SELL", "000001", 3)
+    broker._fills.clear()
+    broker.holdings["000001"] = Holding("000001", "종목000001", 10, 7, 10_000.0, 9_000)  # 나머지 체결
+    run(trader, clock, seconds=3)
+    assert broker.orders[-1] == ("SELL", "000001", 7)
+    assert "000001" in trader.managed
+
+
+def test_locked_trade_log_does_not_lose_position(env, tmp_path):
+    """TL-6/CR-2: trades.csv 가 엑셀로 잠겨도 결과 불명 매수가 관리 대상에 남는다."""
+    broker, clock, trader = env()
+    trader._trades.path = tmp_path / "locked_dir"  # 디렉터리라 파일 열기 실패
+    trader._trades.path.mkdir()
+    broker.prices["000001"] = 10_000
+    orig = broker.buy_market
+
+    def flaky_buy(code, qty):
+        orig(code, qty)
+        raise AmbiguousError("timeout")
+
+    broker.buy_market = flaky_buy
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    assert "000001" in trader.managed
+    broker.prices["000001"] = 9_000
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+    assert trader._trades._pending  # 못 쓴 기록은 보관
+
+
+def test_write_ahead_before_order(env, settings, tmp_path):
+    """TL-7: 주문 요청 중 강제 종료돼도 상태 파일에 주문 중으로 남아 있다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+
+    def interrupted(code, qty):
+        raise KeyboardInterrupt
+
+    broker.buy_market = interrupted
+    trader.on_signal(sig("000001"))
+    with pytest.raises(KeyboardInterrupt):
+        run(trader, clock)
+    t2 = make_trader(FakeBroker(), clock, settings, tmp_path)
+    assert "000001" in t2.managed and "000001" in t2.pending_buys
+
+
+def test_rejected_buy_is_rolled_back(env):
+    broker, clock, trader = env()
+    broker.prices["000001"] = 1_000
+    broker.fail_buy = True
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    assert not trader.pending_buys and "000001" not in trader.managed
+    assert "000001" not in trader.bought_today
+
+
+def test_dry_run_does_not_persist_buys(env, make_settings, settings, tmp_path):
+    """TL-8/MS-8: DRY_RUN 가상 매수가 실매매 전환 후 매수를 막지 않는다."""
+    broker, clock, trader = env(make_settings(dry_run=True))
+    broker.prices["000001"] = 1_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    live = make_trader(broker, clock, settings, tmp_path)
+    live.on_signal(sig("000001"))
+    run(live, clock)
+    assert broker.orders == [("BUY", "000001", 100)]
+
+
+def test_wall_clock_step_back_does_not_stall_exits(env):
+    """TL-9/CR-9: PC 시계가 뒤로 가도 손절 감시는 계속된다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    clock.t -= 600  # 벽시계만 10분 뒤로
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=2)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_state_save_failure_does_not_kill_step(env):
+    """TL-10/CR-8: 날짜 변경 시 저장이 실패해도 step 이 예외로 끝나지 않는다."""
+    broker, clock, trader = env()
+
+    def boom(state):
+        raise PermissionError("locked")
+
+    trader._store.save = boom
+    clock.advance(24 * 3600)
+    trader.step()  # 예외 없이 통과해야 함
+
+
+def test_corrupt_state_refuses_to_start(settings, tmp_path):
+    """TL-11: 상태 파일이 깨졌으면 조용히 비우지 않고 시작을 거부한다."""
+    from autotrader.trader import StateError
+    (tmp_path / "state.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(StateError):
+        make_trader(FakeBroker(), Clock(), settings, tmp_path)
+
+
+def test_backup_used_when_state_missing(settings, tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    store.save({"managed": ["000001"]})
+    store.save({"managed": ["000001", "000002"]})
+    (tmp_path / "state.json").unlink()
+    assert store.load()["managed"] == ["000001"]
+
+
+def test_no_exit_orders_outside_session(env):
+    """TL-12: 장 마감 후에는 시장가 매도를 보내지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    clock.dt = datetime(2026, 10, 8, 16, 0)
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=60)
+    assert [o[0] for o in broker.orders] == ["BUY"]
+    clock.dt = datetime(2026, 10, 9, 9, 0, 5)  # 다음 날 장 시작
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_exits_checked_before_signal_backlog(env):
+    """CR-3: 신호가 많이 쌓여도 손절 확인이 먼저다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    broker.prices["000001"] = 9_000
+    quote_calls = []
+    orig = broker.get_quotes
+
+    def slow_quotes(codes):
+        quote_calls.append(list(codes))
+        return orig(codes)
+
+    broker.get_quotes = slow_quotes
+    for i in range(30):
+        code = f"1{i:05d}"
+        broker.prices[code] = 1_000
+        trader.on_signal(sig(code))
+    trader.step()
+    assert quote_calls[0] == ["000001"]
+    assert ("SELL", "000001", 10) in broker.orders
+    assert len(quote_calls) <= 1 + 3

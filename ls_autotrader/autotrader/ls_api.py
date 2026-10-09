@@ -42,7 +42,9 @@ TOKEN_PATH = "/oauth2/token"
 TOKEN_MIN_REISSUE_SEC = 10  # 토큰 재발급 최소 간격 (재발급하면 기존 토큰이 무효화될 수 있음)
 GLOBAL_TPS = 15  # 전체 TR 합산 상한 (기본 한도 20TPS 보다 여유 있게)
 MULTI_QUOTE_MAX = 50  # t8407 한 번에 조회할 종목 수
+QUERY_TIMEOUT_SEC = 5.0  # 조회 TR 응답 대기 (주문 TR 은 생성자 timeout 사용)
 RATE_LIMIT_CODE = "IGW00201"  # 호출 거래건수를 초과하였습니다.
+HOLDINGS_OK_CODES = {"00000", "00200"}  # 00200: 조회내역이 없습니다
 PAPER_UNSUPPORTED_CODE = "01900"  # 모의투자에서는 해당업무가 제공되지 않습니다.
 CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 
@@ -168,8 +170,7 @@ class LsRestClient:
 
     def invalidate_token(self) -> None:
         with self._token_lock:
-            self._token = ""
-            self._refresh_at = None
+            self._refresh_at = None  # 다음 사용 때 재발급 (같은 토큰이 오면 버전은 그대로)
 
     def _load_cached_token(self) -> None:
         assert self._cache_file is not None
@@ -210,10 +211,14 @@ class LsRestClient:
         issued = self._now()
         expires_in = to_int(body.get("expires_in") or body.get("expire_in")) or 86400
         expiry = next_token_expiry(issued, expires_in)
-        margin = min(timedelta(minutes=5), (expiry - issued) / 2)
+        if expiry - issued <= timedelta(minutes=10):
+            # 07:00 직전 발급: 새로 받아도 07:00 에 만료되므로 07:00 이 지난 뒤 한 번만 갱신
+            self._refresh_at = expiry + timedelta(seconds=5)
+        else:
+            self._refresh_at = expiry - timedelta(minutes=5)
+        if token != self._token:
+            self.token_version += 1
         self._token = token
-        self._refresh_at = expiry - margin
-        self.token_version += 1
         log.info("[%s] 접근토큰 발급 완료 (만료 예상 %s)", self.label,
                  expiry.astimezone(KST).strftime("%m-%d %H:%M"))
         if self._cache_file is not None:
@@ -250,7 +255,8 @@ class LsRestClient:
                 headers["mac_address"] = self._mac
             try:
                 resp = self._http.post(self._base + path, headers=headers, json=body,
-                                       timeout=self._timeout)
+                                       timeout=self._timeout if is_order else
+                                       min(self._timeout, QUERY_TIMEOUT_SEC))
             except requests.RequestException as e:
                 raise LsApiError(tr_cd, f"[{self.label}] 요청 실패: {e}", ambiguous=is_order) from e
             data = _json(resp)
@@ -300,6 +306,16 @@ def _is_token_error(status: int, rsp_cd: str, rsp_msg: str) -> bool:
     return "token" in text or "토큰" in text
 
 
+def _check_holdings_page(data: dict) -> None:
+    """t0424 응답이 정상인지 확인한다. 오류 응답을 '보유 종목 없음'으로 읽으면 안 된다."""
+    rsp_cd = clean_str(data.get("rsp_cd"))
+    ok = rsp_cd in HOLDINGS_OK_CODES or (rsp_cd == "" and isinstance(data.get("t0424OutBlock"), dict))
+    rows = data.get("t0424OutBlock1")
+    if not ok or (rows is not None and not isinstance(rows, list)):
+        raise LsApiError("t0424", f"잔고 조회 응답 이상: {rsp_cd} {clean_str(data.get('rsp_msg'))}",
+                         rsp_cd=rsp_cd, rsp_msg=clean_str(data.get("rsp_msg")))
+
+
 def _header(headers: dict, name: str) -> str:
     for k, v in headers.items():
         if k.lower() == name:
@@ -318,26 +334,30 @@ class MarketData:
         self._user_id = user_id
 
     def list_conditions(self) -> list[Condition]:
-        result: list[Condition] = []
+        result: dict[str, Condition] = {}
         cont, cont_key = "0", ""
+        tr_cont, tr_cont_key = "N", ""
+        seen_keys: set[str] = set()
         for _ in range(50):
-            data, _ = self.client.call("t1866", {"t1866InBlock": {
+            data, headers = self.client.call("t1866", {"t1866InBlock": {
                 "user_id": self._user_id, "gb": "0", "group_name": "",
                 "cont": cont, "cont_key": cont_key,
-            }})
+            }}, tr_cont=tr_cont, tr_cont_key=tr_cont_key)
             for row in data.get("t1866OutBlock1") or []:
-                result.append(Condition(
-                    # query_index 는 공백 패딩이 있을 수 있어 NUL 만 제거하고 그대로 쓴다
-                    query_index=str(row.get("query_index") or "").split("\x00", 1)[0],
-                    group_name=clean_str(row.get("group_name")),
-                    query_name=clean_str(row.get("query_name")),
-                ))
+                # query_index 는 공백 패딩이 있을 수 있어 NUL 만 제거하고 그대로 쓴다
+                qi = str(row.get("query_index") or "").split("\x00", 1)[0]
+                if qi and qi not in result:
+                    result[qi] = Condition(query_index=qi,
+                                           group_name=clean_str(row.get("group_name")),
+                                           query_name=clean_str(row.get("query_name")))
             out = data.get("t1866OutBlock") or {}
             cont = clean_str(out.get("cont"))
             cont_key = clean_str(out.get("contkey") or out.get("cont_key"))
-            if cont != "1" or not cont_key:
+            if cont != "1" or not cont_key or cont_key in seen_keys:
                 break
-        return result
+            seen_keys.add(cont_key)
+            tr_cont, tr_cont_key = "Y", _header(headers, "tr_cont_key")
+        return list(result.values())
 
     def search_condition_once(self, query_index: str) -> list[tuple[str, str, int]]:
         """현재 조건을 만족하는 종목 (코드, 종목명, 현재가)."""
@@ -410,6 +430,7 @@ class Account:
                                   "cts_expcode": cts}},
                 tr_cont=tr_cont, tr_cont_key=tr_cont_key,
             )
+            _check_holdings_page(data)
             for row in data.get("t0424OutBlock1") or []:
                 code = clean_str(row.get("expcode"))
                 if code.startswith("A") and len(code) == 7:
