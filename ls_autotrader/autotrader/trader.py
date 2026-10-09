@@ -181,6 +181,8 @@ class AutoTrader:
         self._dry_bought: set[str] = set()  # DRY_RUN 가상 매수 (파일에 저장하지 않음)
         self._miss: dict[str, int] = {}  # 관리 종목이 잔고에서 연속으로 안 보인 횟수
         self._recent: dict[str, int] = {}  # 최근 잔고에 있던 모든 종목 (한 번 빠져도 '보유'로 간주)
+        self._seen: dict[str, tuple[int, float]] = {}  # 관리 종목의 마지막 (수량, 평균단가)
+        self._absent: set[str] = set()  # 마지막으로 본 뒤 잔고에서 한 번이라도 빠졌던 관리 종목
         self._order_mono: dict[tuple[str, str], float] = {}  # (BUY|SELL, 종목) → 주문 시각(단조시계)
         self._sell_rejects: dict[str, int] = {}
         self._state_date = ""
@@ -280,14 +282,34 @@ class AutoTrader:
             else:
                 self._recent[code] = n
         tracked = self.managed | set(self.pending_buys) | set(self.pending_sells)
-        for code in tracked:
-            self._miss[code] = 0 if code in holdings else self._miss.get(code, 0) + 1
-        for code in list(self._miss):
-            if code not in tracked:
-                del self._miss[code]
         # '없어졌다'는 판단은 봇이 팔 수 있었던 시간(평일 장중 + 마감 동시호가 반영 여유)에만 한다.
-        # 밤사이 점검 시간의 빈 응답 때문에 관리 종목을 잃지 않기 위해서다.
+        # 밤사이 점검 시간의 빈 응답 때문에 관리 종목을 잃지 않기 위해서다. (그 시간에는 횟수도 안 셈)
         may_prune = in_buy_window(self._now(), SELL_START, PRUNE_END)
+        for code in tracked:
+            h = holdings.get(code)
+            if h is None:
+                self._absent.add(code)
+                if may_prune:
+                    self._miss[code] = self._miss.get(code, 0) + 1
+                continue
+            self._miss[code] = 0
+            sig = (h.qty, round(h.avg_price, 2))
+            prev = self._seen.get(code)
+            if (code in self._absent and prev is not None and prev != sig
+                    and code in self.managed and code not in self.pending_buys
+                    and code not in self.pending_sells):
+                # 잔고에서 사라졌다가 수량/평균단가가 달라져 다시 나타남 → 사용자가 직접 팔고 다시 산 것
+                log.warning("관리 종목 %s 이(가) 잔고에서 사라졌다가 다른 수량/평균단가(%s → %s)로 다시 나타나 "
+                            "사용자 보유로 보고 관리 대상에서 제외합니다.", code, prev, sig)
+                self.managed.discard(code)
+                changed = True
+            self._seen[code] = sig
+            self._absent.discard(code)
+        for d in (self._miss, self._seen):
+            for code in list(d):
+                if code not in tracked and code not in self.managed:
+                    del d[code]
+        self._absent &= self.managed | set(self.pending_buys) | set(self.pending_sells)
         gone = ({c for c in tracked if self._miss.get(c, 0) >= MISS_CONFIRM}
                 if may_prune else set())
 

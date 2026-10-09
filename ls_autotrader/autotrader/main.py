@@ -221,6 +221,11 @@ def find_orphan_states(settings: Settings, current: Path) -> list[tuple[Path, li
     return found
 
 
+LEGACY_REAL_HELP = ("이전 버전의 data\\state.json 은 모드 구분 없이 저장돼 대개 모의투자 기록입니다. "
+                    "실거래 모드로는 가져올 수 없습니다. 모의투자 종목이면 TRADING_MODE=paper 로 바꿔 가져오고, "
+                    "아니면 보유 종목을 직접 확인·정리한 뒤 파일을 다른 폴더로 옮기세요.")
+
+
 def adopt_state(src: Path, store: StateStore) -> int:
     try:
         old = json.loads(src.read_text(encoding="utf-8"))
@@ -228,6 +233,15 @@ def adopt_state(src: Path, store: StateStore) -> int:
             raise ValueError("not an object")
     except (OSError, ValueError) as e:
         print(f"상태 파일을 읽을 수 없습니다: {src} ({e})", file=sys.stderr)
+        return 1
+    mode = store.identity.get("mode")
+    src_mode = (old.get("identity") or {}).get("mode")
+    if src_mode is not None and src_mode != mode:
+        print(f"{src.name} 은(는) {src_mode} 모드의 상태 파일이라 {mode} 모드로 가져올 수 없습니다.",
+              file=sys.stderr)
+        return 1
+    if src_mode is None and mode == "real":
+        print(LEGACY_REAL_HELP, file=sys.stderr)
         return 1
     cur = store.load()
     merged = dict(cur)
@@ -358,6 +372,9 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
         for path, codes in orphans:
             log.error("현재 키로 읽지 않는 상태 파일에 봇이 산 종목이 남아 있습니다: %s → %s",
                       path.name, ", ".join(codes))
+        if settings.is_real and any(p.name == "state.json" for p, _ in orphans):
+            log.error(LEGACY_REAL_HELP)
+            return 1
         log.error("이 종목들의 익절/손절 감시가 끊기지 않도록 실행을 멈춥니다.\n"
                   "  - 같은 계좌(이전 버전 실행, App Key 재발급 등)라면: "
                   "python -m autotrader --adopt-state \"%s\" 로 가져온 뒤 다시 실행하세요.\n"

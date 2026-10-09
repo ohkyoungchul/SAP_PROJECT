@@ -685,3 +685,41 @@ def test_repeated_sell_rejections_back_off(env, make_settings):
     run(trader, clock, seconds=200)
     gaps = [b - a for a, b in zip(calls, calls[1:])]
     assert gaps[0] < gaps[-1] and len(calls) <= 6
+
+
+def test_user_rebuy_after_hours_not_treated_as_bot_position(env):
+    """R3-1: 사용자가 장 마감 후 팔고 다음 날 아침 다시 사면 봇이 팔지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    clock.dt = datetime(2026, 10, 8, 16, 30)
+    del broker.holdings["000001"]  # 사용자가 시간외에 직접 매도
+    run(trader, clock, seconds=10)
+    clock.dt = datetime(2026, 10, 9, 8, 35)
+    broker.holdings["000001"] = Holding("000001", "종목000001", 20, 20, 8_000.0, 8_000)  # 직접 재매수
+    run(trader, clock, seconds=4)
+    clock.dt = datetime(2026, 10, 9, 9, 0, 5)
+    broker.prices["000001"] = 7_700
+    run(trader, clock)
+    assert [o for o in broker.orders if o[0] == "SELL"] == []
+    assert "000001" not in trader.managed
+
+
+def test_overnight_misses_not_counted(env):
+    """밤사이 빈 응답 뒤 09:00 첫 조회 한 번이 비어도 관리 종목을 버리지 않는다."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    real = broker.get_holdings
+    broker.get_holdings = lambda: []
+    clock.dt = datetime(2026, 10, 8, 23, 0)
+    run(trader, clock, seconds=20)
+    clock.dt = datetime(2026, 10, 9, 9, 0, 0)
+    trader.reconcile()  # 09:00 첫 조회도 빈 응답
+    assert "000001" in trader.managed
+    broker.get_holdings = real
+    broker.prices["000001"] = 9_000
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)

@@ -415,3 +415,20 @@ def test_runtime_afr_rejection_keeps_retrying(tmp_path, monkeypatch):
         stop.set()
         t.join(10)
         http.shutdown()
+
+
+def test_adopt_refuses_paper_or_legacy_state_in_real_mode(tmp_path, monkeypatch):
+    """R3-2/LC-2: 실거래 모드에서는 모의투자/구버전 상태를 가져오지 않는다."""
+    from autotrader.trader import StateStore
+    real_store = StateStore(tmp_path / "state_real_x.json", identity={"mode": "real", "account": "x"})
+    legacy = tmp_path / "state.json"
+    legacy.write_text(json.dumps({"managed": ["005930"]}), encoding="utf-8")
+    assert main_mod.adopt_state(legacy, real_store) == 1
+    paper = tmp_path / "state_paper_y.json"
+    paper.write_text(json.dumps({"managed": ["005930"], "identity": {"mode": "paper", "account": "y"}}),
+                     encoding="utf-8")
+    assert main_mod.adopt_state(paper, real_store) == 1
+    assert not real_store.path.exists()
+    paper_store = StateStore(tmp_path / "state_paper_z.json", identity={"mode": "paper", "account": "z"})
+    assert main_mod.adopt_state(paper, paper_store) == 0
+    assert json.loads(paper_store.path.read_text(encoding="utf-8"))["managed"] == ["005930"]
