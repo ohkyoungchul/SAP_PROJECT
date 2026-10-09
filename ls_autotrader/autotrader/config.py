@@ -107,12 +107,25 @@ class Settings:
     sell_retry_sec: float
 
     data_dir: Path
-    order_mbr_no: str = ""
+    order_mbr_no: str = "KRX"
     mac_address: str = ""
+    # 조건검색·시세 조회 전용 키 (모의투자 키로 조건검색이 안 될 때 실전 키를 넣는다)
+    data_appkey: str = ""
+    data_appsecret: str = ""
+    skip_env_check: bool = False
 
     @property
     def is_real(self) -> bool:
         return self.trading_mode == "real"
+
+    @property
+    def uses_data_key(self) -> bool:
+        return bool(self.data_appkey)
+
+    @property
+    def condition_server_is_real(self) -> bool:
+        """조건검색(t1860/AFR)을 실전 서버 토큰으로 하는지 여부 → WebSocket 포트 결정."""
+        return self.is_real or self.uses_data_key
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -125,9 +138,17 @@ class Settings:
                 f"{REAL_CONFIRM_PHRASE} 를 함께 설정해야만 실행됩니다."
             )
 
+        data_appkey = _get("LS_DATA_APPKEY", "")
+        data_appsecret = _get("LS_DATA_APPSECRET", "")
+        if bool(data_appkey) != bool(data_appsecret):
+            raise ConfigError("LS_DATA_APPKEY 와 LS_DATA_APPSECRET 은 함께 설정해야 합니다.")
+        if mode == "real" and data_appkey:
+            raise ConfigError("실거래 모드에서는 LS_DATA_APPKEY 를 쓰지 않습니다 (LS_APPKEY 하나로 충분).")
+        # 실시간 조건검색(AFR)은 조건검색에 쓰는 키와 같은 서버의 WebSocket 에 붙어야 한다.
+        # 실전 9443, 모의투자 29443 (경로는 /websocket)
         default_ws = (
             "wss://openapi.ls-sec.co.kr:9443/websocket"
-            if mode == "real"
+            if mode == "real" or data_appkey
             else "wss://openapi.ls-sec.co.kr:29443/websocket"
         )
 
@@ -160,12 +181,15 @@ class Settings:
             buy_job_flags=flags,
             buy_initial_matches=_get_bool("BUY_INITIAL_MATCHES", False),
             price_poll_sec=_get_float("PRICE_POLL_SEC", 1.0),
-            balance_poll_sec=_get_float("BALANCE_POLL_SEC", 3.0),
+            balance_poll_sec=_get_float("BALANCE_POLL_SEC", 2.0),
             buy_fill_timeout_sec=_get_float("BUY_FILL_TIMEOUT_SEC", 60.0),
             sell_retry_sec=_get_float("SELL_RETRY_SEC", 20.0),
             data_dir=Path(_get("DATA_DIR", "data")),
-            order_mbr_no=_get("ORDER_MBR_NO", ""),
+            order_mbr_no=_get("ORDER_MBR_NO", "KRX").upper(),
             mac_address=_get("LS_MAC_ADDRESS", ""),
+            data_appkey=data_appkey,
+            data_appsecret=data_appsecret,
+            skip_env_check=_get_bool("SKIP_ENV_CHECK", False),
         )
         s.validate()
         return s
@@ -183,5 +207,8 @@ class Settings:
             raise ConfigError("BUY_START 는 BUY_END 보다 빨라야 합니다.")
         if not self.buy_job_flags:
             raise ConfigError("BUY_JOB_FLAGS 가 비어 있습니다.")
-        if self.price_poll_sec <= 0 or self.balance_poll_sec <= 0:
-            raise ConfigError("폴링 주기는 0보다 커야 합니다.")
+        if self.price_poll_sec < 0.5 or self.balance_poll_sec < 1.0:
+            raise ConfigError("PRICE_POLL_SEC 는 0.5초 이상, BALANCE_POLL_SEC 는 1초 이상이어야 합니다 "
+                              "(LS 초당 호출 한도: t8407 5회, t0424 2회).")
+        if self.order_mbr_no not in ("KRX", "NXT"):
+            raise ConfigError("ORDER_MBR_NO 는 KRX 또는 NXT 여야 합니다.")

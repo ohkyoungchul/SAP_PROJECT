@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .config import Settings
+from .ls_api import valid_code
 from .models import ConditionSignal, Holding, OrderResult, Quote
 from .strategy import STOP_LOSS, TAKE_PROFIT, calc_buy_qty, exit_reason, in_buy_window
 
@@ -235,6 +236,9 @@ class AutoTrader:
 
     def _handle_signal(self, sig: ConditionSignal) -> None:
         code = sig.code
+        if not valid_code(code):
+            log.warning("종목코드 형식이 올바르지 않은 신호 무시: %r", code)
+            return
         if sig.job_flag not in self._s.buy_job_flags:
             log.debug("매수 대상 아님(구분 %s): %s %s", sig.job_flag, code, sig.name)
             return
@@ -256,10 +260,13 @@ class AutoTrader:
             log.info("최대 보유 종목 수(%d) 도달로 매수하지 않음: %s", self._s.max_positions, tag)
             return
 
-        quote = self._b.get_quotes([code]).get(code)
         ref_price = 0
-        if quote is not None:
-            ref_price = quote.ask if quote.ask > 0 else quote.price
+        try:
+            quote = self._b.get_quotes([code]).get(code)
+            if quote is not None:
+                ref_price = quote.ask if quote.ask > 0 else quote.price
+        except Exception as e:  # noqa: BLE001
+            log.warning("현재가 조회 실패, 신호 가격으로 대신 계산: %s (%s)", tag, e)
         if ref_price <= 0:
             ref_price = sig.price
         qty = calc_buy_qty(self._s.buy_amount, ref_price)
@@ -280,24 +287,31 @@ class AutoTrader:
         try:
             res = self._b.buy_market(code, qty)
         except Exception as e:  # noqa: BLE001
-            log.error("매수 주문 실패: %s %d주 — %s", tag, qty, e)
+            ambiguous = bool(getattr(e, "ambiguous", False))
             self._trades.write(time=self._now().isoformat(timespec="seconds"),
                                mode=self._s.trading_mode, side="BUY", code=code, name=sig.name,
                                qty=qty, ref_price=ref_price, reason=f"조건편입({sig.job_flag})",
-                               result=f"error: {e}")
-            return
+                               result=f"{'unknown' if ambiguous else 'error'}: {e}")
+            if not ambiguous:
+                log.error("매수 주문 거부/실패: %s %d주 — %s", tag, qty, e)
+                return
+            # 접수됐는지 알 수 없다 → 같은 종목을 다시 사지 않도록 주문된 것으로 보고 잔고로 확인한다
+            log.error("매수 주문 결과 불명(접수됐을 수 있음): %s %d주 — %s → 잔고로 확인합니다", tag, qty, e)
+            res = OrderResult(ord_no=0, rsp_cd="", rsp_msg="unknown")
 
-        log.info("매수 주문 접수: %s %d주 시장가 (기준가 %d원, 주문번호 %d) [%d/%d]",
-                 tag, qty, ref_price, res.ord_no, used + 1, self._s.max_positions)
+        if res.ord_no:
+            log.info("매수 주문 접수: %s %d주 시장가 (기준가 %d원, 주문번호 %d) [%d/%d]",
+                     tag, qty, ref_price, res.ord_no, used + 1, self._s.max_positions)
         self.pending_buys[code] = PendingBuy(code=code, name=sig.name, qty=qty,
                                              ord_no=res.ord_no, ordered_at=self._clock())
         self.managed.add(code)
         self.bought_today.add(code)
         self._save_state()
-        self._trades.write(time=self._now().isoformat(timespec="seconds"),
-                           mode=self._s.trading_mode, side="BUY", code=code, name=sig.name, qty=qty,
-                           ref_price=ref_price, reason=f"조건편입({sig.job_flag})",
-                           ord_no=res.ord_no, result=f"{res.rsp_cd} {res.rsp_msg}")
+        if res.ord_no:
+            self._trades.write(time=self._now().isoformat(timespec="seconds"),
+                               mode=self._s.trading_mode, side="BUY", code=code, name=sig.name,
+                               qty=qty, ref_price=ref_price, reason=f"조건편입({sig.job_flag})",
+                               ord_no=res.ord_no, result=f"{res.rsp_cd} {res.rsp_msg}")
         self._next_reconcile = min(self._next_reconcile, self._clock() + 1.0)
 
     # ----------------------------------------------------------- exits
@@ -307,11 +321,15 @@ class AutoTrader:
                    and self.holdings[c].sellable_qty > 0]
         if not targets:
             return
-        quotes = self._b.get_quotes(targets)
+        try:
+            quotes = self._b.get_quotes(targets)
+        except Exception as e:  # noqa: BLE001
+            log.warning("현재가 조회 실패, 잔고의 현재가로 판단합니다: %s", e)
+            quotes = {}
         for code in targets:
             h = self.holdings[code]
             q = quotes.get(code)
-            price = q.price if q is not None and q.price > 0 else 0
+            price = q.price if q is not None and q.price > 0 else h.last_price
             if price <= 0:
                 continue
             reason = exit_reason(h.avg_price, price, self._s.take_profit_pct, self._s.stop_loss_pct)
@@ -330,11 +348,19 @@ class AutoTrader:
         try:
             res = self._b.sell_market(h.code, h.sellable_qty)
         except Exception as e:  # noqa: BLE001
-            log.error("%s 매도 주문 실패: %s %d주 — %s", label, tag, h.sellable_qty, e)
+            ambiguous = bool(getattr(e, "ambiguous", False))
+            log.error("%s 매도 주문 %s: %s %d주 — %s (%.0f초 뒤 잔고를 보고 다시 판단)", label,
+                      "결과 불명" if ambiguous else "실패", tag, h.sellable_qty, e,
+                      self._s.sell_retry_sec)
             self._trades.write(time=self._now().isoformat(timespec="seconds"),
                                mode=self._s.trading_mode, side="SELL", code=h.code, name=h.name,
                                qty=h.sellable_qty, ref_price=price, avg_price=h.avg_price,
-                               reason=label, result=f"error: {e}")
+                               reason=label, result=f"{'unknown' if ambiguous else 'error'}: {e}")
+            # 바로 재주문하지 않도록 대기 상태로 둔다 (중복 매도 방지 / 거부 반복 방지)
+            self.pending_sells[h.code] = PendingSell(code=h.code, name=h.name, qty=h.sellable_qty,
+                                                     ord_no=0, reason=reason,
+                                                     ordered_at=self._clock())
+            self._save_state()
             return
         log.info("%s 매도 주문 접수: %s %d주 시장가 (현재가 %d원, 평균단가 %.0f원, %+.2f%%, 주문번호 %d)",
                  label, tag, h.sellable_qty, price, h.avg_price, rate, res.ord_no)

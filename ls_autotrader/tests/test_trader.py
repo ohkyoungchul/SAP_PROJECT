@@ -316,3 +316,84 @@ def test_trade_log_written(env, tmp_path):
     run(trader, clock)
     text = (tmp_path / "trades.csv").read_text(encoding="utf-8-sig")
     assert "BUY" in text and "000001" in text
+
+
+class AmbiguousError(RuntimeError):
+    ambiguous = True
+
+
+def test_ambiguous_buy_is_tracked_not_repeated(env):
+    """주문 응답이 타임아웃이어도 실제로 체결됐을 수 있다 → 재매수 금지 + 체결되면 관리."""
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    orig = broker.buy_market
+
+    def flaky_buy(code, qty):
+        orig(code, qty)  # 서버에는 접수됨
+        raise AmbiguousError("read timeout")
+
+    broker.buy_market = flaky_buy
+    trader.on_signal(sig("000001"))
+    trader.on_signal(sig("000001", flag="R"))
+    run(trader, clock)
+    assert broker.orders == [("BUY", "000001", 10)]
+    assert "000001" in trader.managed and "000001" in trader.holdings
+    broker.prices["000001"] = 9_000
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_rejected_sell_is_throttled(env, make_settings):
+    broker, clock, trader = env(make_settings(sell_retry_sec=10.0))
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+    calls = []
+
+    def reject(code, qty):
+        calls.append(code)
+        raise RuntimeError("매도가능수량 부족")
+
+    broker.sell_market = reject
+    broker.prices["000001"] = 9_000
+    run(trader, clock, seconds=5)
+    assert len(calls) == 1  # 1초마다 재주문하지 않음
+    run(trader, clock, seconds=10)
+    assert len(calls) == 2
+
+
+def test_quote_failure_falls_back_to_balance_price(env):
+    broker, clock, trader = env()
+    broker.prices["000001"] = 10_000
+    trader.on_signal(sig("000001"))
+    run(trader, clock)
+
+    def boom(codes):
+        raise RuntimeError("t8407 unavailable")
+
+    broker.get_quotes = boom
+    broker.prices["000001"] = 9_000  # 잔고(t0424)의 현재가에 반영됨
+    h = broker.holdings["000001"]
+    broker.holdings["000001"] = Holding(h.code, h.name, h.qty, h.sellable_qty, h.avg_price, 9_000)
+    run(trader, clock)
+    assert broker.orders[-1] == ("SELL", "000001", 10)
+
+
+def test_buy_uses_signal_price_when_quote_fails(env):
+    broker, clock, trader = env()
+
+    def boom(codes):
+        raise RuntimeError("t8407 unavailable")
+
+    broker.get_quotes = boom
+    broker.prices["000001"] = 2_000
+    trader.on_signal(sig("000001", price=2_000))
+    run(trader, clock)
+    assert broker.orders == [("BUY", "000001", 50)]
+
+
+def test_invalid_signal_code_ignored(env):
+    broker, clock, trader = env()
+    trader.on_signal(sig("\x007720"))
+    run(trader, clock)
+    assert broker.orders == []
