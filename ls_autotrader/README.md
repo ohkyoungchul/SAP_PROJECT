@@ -40,7 +40,33 @@ LS증권 OPEN API(REST + WebSocket)를 사용하며, Windows PC에서 Python으�
    - git-scm.com에서 설치합니다.
    - Git 없이 받으려면 GitHub 저장소에서 `claude/quirky-tesla-le47nl` 브랜치를 고른 뒤 Code → Download ZIP으로 받아 압축을 풀면 됩니다.
 
-## 2. 설치 (Windows 명령 프롬프트)
+## 2. 설치
+
+### 자동 설치 (권장): `C:\workspace\Stock_Trading`
+
+**명령 프롬프트**(시작 → `cmd`)에 아래 두 줄을 차례로 붙여 넣습니다. Git은 필요 없습니다.
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; New-Item -ItemType Directory -Force C:\workspace | Out-Null; iwr -UseBasicParsing https://raw.githubusercontent.com/ohkyoungchul/SAP_PROJECT/claude/quirky-tesla-le47nl/ls_autotrader/install.ps1 -OutFile C:\workspace\install_stock_trading.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\workspace\install_stock_trading.ps1
+```
+
+설치 스크립트가 하는 일
+1. Python 3.10 이상이 있는지 확인합니다. 없으면 winget으로 설치할지 묻습니다.
+2. 최신 코드를 받아 `C:\workspace\Stock_Trading`에 복사합니다.
+3. 가상환경과 패키지를 설치합니다.
+4. `.env`를 만들어 메모장으로 엽니다.
+5. 실행 파일 3개를 만듭니다.
+
+| 파일 | 용도 |
+|---|---|
+| `run.bat` | 자동매매 실행 |
+| `list_conditions.bat` | 서버저장 조건식 목록 확인 |
+| `update.bat` | 최신 코드로 업데이트. `.env`, `data` 폴더는 그대로 둠 |
+
+다른 폴더에 설치하려면 두 번째 줄 끝에 `-Target D:\원하는\폴더`를 붙입니다.
+
+### 수동 설치 (Windows 명령 프롬프트)
 
 ```bat
 git clone -b claude/quirky-tesla-le47nl https://github.com/ohkyoungchul/SAP_PROJECT.git
@@ -72,6 +98,12 @@ CONDITION_NAME=떡상이
 ```
 
 ## 3. 실행
+
+자동 설치를 했다면 아래 배치 파일을 더블클릭하면 됩니다.
+1. `list_conditions.bat`: 조건식 목록 확인
+2. `run.bat`: 자동매매 실행
+
+수동 설치를 했다면 아래 명령을 씁니다.
 
 ```bat
 :: (1) 서버에 저장된 조건식 목록 확인
