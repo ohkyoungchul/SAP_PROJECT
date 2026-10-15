@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import ConfigError, Settings, load_env_file
+from .entry_filter import EntryFilter, StrategyError, apply_trade_overrides
 from .ls_api import Account, LsApiError, LsBroker, LsRestClient, MarketData, clean_str, to_int
 from .models import Condition, ConditionSignal
 from .realtime import RealtimeClient
@@ -286,6 +287,8 @@ def main(argv: list[str] | None = None, stop_event: threading.Event | None = Non
                         help="서버에 저장된 조건식 목록만 출력하고 종료")
     parser.add_argument("--adopt-state", metavar="파일",
                         help="이전 버전/다른 키의 상태 파일에 있는 '봇이 산 종목'을 현재 상태 파일로 가져오고 종료")
+    parser.add_argument("--check-strategy", action="store_true",
+                        help="전략 파일·일봉 특성 파일을 검사하고 적용될 설정을 출력한 뒤 종료 (API 호출 없음)")
     args = parser.parse_args(argv)
 
     try:
@@ -294,6 +297,8 @@ def main(argv: list[str] | None = None, stop_event: threading.Event | None = Non
     except ConfigError as e:
         print(f"설정 오류: {e}", file=sys.stderr)
         return 2
+    if args.check_strategy:
+        return check_strategy(settings)
 
     lock = InstanceLock(settings.data_dir / "autotrader.lock")
     if not args.list_conditions and not lock.acquire():
@@ -308,9 +313,38 @@ def main(argv: list[str] | None = None, stop_event: threading.Event | None = Non
         shutdown_logging()
 
 
+def check_strategy(settings: Settings) -> int:
+    from datetime import date, timedelta
+    now = datetime.now()
+    target = date.today() + timedelta(days=1) if now.hour >= 16 else date.today()  # 장 마감 후면 다음 날 기준
+    try:
+        f = EntryFilter(settings.strategy_file, settings.daily_features_file, today=target)
+        eff = apply_trade_overrides(settings, f.trade_overrides())
+    except (StrategyError, ConfigError) as e:
+        print(f"전략 파일 오류: {e}", file=sys.stderr)
+        return 2
+    print(f"검사 기준일: {target} ({'다음 거래일 기준' if target != date.today() else '오늘'})")
+    print(f"전략: {f.describe()}")
+    if f.trade_overrides():
+        print(f"  전략 파일이 .env 값을 덮어씀: {f.trade_overrides()}")
+    print(f"적용될 설정: 익절 +{eff.take_profit_pct}% / 손절 -{eff.stop_loss_pct}% / 신규매수 "
+          f"{eff.buy_start:%H:%M}~{eff.buy_end:%H:%M} / 1회 {eff.buy_amount:,}원 / 최대 {eff.max_positions}종목")
+    if f.needs_daily and f.features:
+        passed = [c for c, d in f.features.items() if f.check(c, d.prev_close, target)[0]]
+        print(f"참고: 전일 종가로 계산하면 필터 통과 {len(passed)}종목 / {len(f.features)}종목")
+    return 0
+
+
 def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Event) -> int:
     setup_logging(settings.data_dir)
     disable_quick_edit()
+    env_settings = settings  # 전략 파일이 바뀌면 이 값 위에 다시 덮어쓴다
+    try:
+        entry_filter = EntryFilter(settings.strategy_file, settings.daily_features_file)
+        settings = apply_trade_overrides(settings, entry_filter.trade_overrides())
+    except (StrategyError, ConfigError) as e:
+        log.error("전략 파일 오류로 시작하지 않습니다: %s", e)
+        return 1
     token_dir = settings.data_dir / "tokens"
     trade_label = "실전" if settings.is_real else "모의투자"
     trade_client = LsRestClient(settings.appkey, settings.appsecret, settings.rest_base,
@@ -364,6 +398,9 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
              f"{settings.buy_amount:,}", settings.max_positions, settings.take_profit_pct,
              settings.stop_loss_pct, settings.buy_start.strftime("%H:%M"),
              settings.buy_end.strftime("%H:%M"))
+    log.info("전략: %s", entry_filter.describe())
+    if entry_filter.trade_overrides():
+        log.info("전략 파일이 .env 값을 덮어씀: %s", entry_filter.trade_overrides())
     log.info("=" * 64)
 
     store = current_store(settings)
@@ -383,7 +420,7 @@ def _run(args: argparse.Namespace, settings: Settings, stop_event: threading.Eve
         return 1
     trades = TradeLog(settings.data_dir / "trades.csv")
     try:
-        trader = AutoTrader(broker, settings, store=store, trade_log=trades)
+        trader = AutoTrader(broker, env_settings, store=store, trade_log=trades, entry_filter=entry_filter)
     except StateError as e:
         log.error("%s", e)
         return 1

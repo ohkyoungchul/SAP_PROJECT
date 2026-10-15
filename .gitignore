@@ -5,3 +5,4 @@ __pycache__/
 .env
 ls_autotrader/data/
 data/
+.venv-ana/

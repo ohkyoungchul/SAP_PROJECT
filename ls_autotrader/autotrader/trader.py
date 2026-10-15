@@ -26,7 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .config import Settings
+from .config import ConfigError, Settings
+from .entry_filter import EntryFilter, StrategyError, apply_trade_overrides
 from .ls_api import valid_code
 from .models import ConditionSignal, Holding, OrderResult, Quote
 from .strategy import (PRUNE_END, SELL_START, STOP_LOSS, TAKE_PROFIT, calc_buy_qty, exit_reason,
@@ -162,9 +163,14 @@ class AutoTrader:
     def __init__(self, broker: Broker, settings: Settings, *, store: StateStore,
                  trade_log: TradeLog, clock: Callable[[], float] = time.time,
                  mono: Callable[[], float] = time.monotonic,
-                 now: Callable[[], datetime] = datetime.now) -> None:
+                 now: Callable[[], datetime] = datetime.now,
+                 entry_filter: EntryFilter | None = None) -> None:
         self._b = broker
+        self._base_settings = settings  # .env 값 (전략 파일의 trade 값을 덮어쓰기 전)
         self._s = settings
+        self._filter = entry_filter
+        if entry_filter is not None:
+            self._s = apply_trade_overrides(settings, entry_filter.trade_overrides())
         self._store = store
         self._trades = trade_log
         self._clock = clock  # 벽시계 (파일에 남기는 주문 시각)
@@ -238,6 +244,27 @@ class AutoTrader:
             self.pending_buys.clear()
             self._sell_rejects.clear()
             self._save_state()
+            self._reload_strategy()
+
+    @property
+    def settings(self) -> Settings:
+        return self._s
+
+    def _reload_strategy(self) -> None:
+        """날짜가 바뀌면 전략 파일·일봉 특성 파일을 다시 읽는다 (주간 재최적화 결과 반영)."""
+        if self._filter is None:
+            return
+        try:
+            changed = self._filter.reload(self._now().date())
+            new = apply_trade_overrides(self._base_settings, self._filter.trade_overrides())
+        except (StrategyError, ConfigError) as e:
+            log.error("전략 재적용 실패, 기존 설정을 유지합니다: %s", e)
+            return
+        log.info("전략: %s", self._filter.describe())
+        if changed or new != self._s:
+            log.info("전략 변경 적용: 익절 +%s%% / 손절 -%s%% / 신규매수 %s~%s", new.take_profit_pct,
+                     new.stop_loss_pct, new.buy_start.strftime("%H:%M"), new.buy_end.strftime("%H:%M"))
+        self._s = new
 
     # ------------------------------------------------------------ input
     def on_signal(self, signal: ConditionSignal) -> None:
@@ -433,6 +460,11 @@ class AutoTrader:
             log.info("주가(%d원)가 1회 주문금액(%d원)보다 커서 매수하지 않음: %s",
                      ref_price, self._s.buy_amount, tag)
             return
+        if self._filter is not None:
+            ok, why = self._filter.check(code, ref_price, self._now().date())
+            if not ok:
+                log.info("전략 필터 불통과(%s)로 매수하지 않음: %s", why, tag)
+                return
         reason = f"조건편입({sig.job_flag})"
 
         if self._s.dry_run:

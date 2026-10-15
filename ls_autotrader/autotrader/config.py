@@ -127,6 +127,9 @@ class Settings:
     data_appkey: str = ""
     data_appsecret: str = ""
     skip_env_check: bool = False
+    # 매수 직전 추가 필터 (entry_filter.py). 파일이 없으면 추가 필터 없이 동작한다.
+    strategy_file: Path = Path("data/strategy/strategy.json")
+    daily_features_file: Path = Path("data/strategy/daily_features.csv")
 
     @property
     def is_real(self) -> bool:
@@ -194,6 +197,7 @@ class Settings:
                     f"{'실전' if want == 9443 else '모의투자'} 키이므로 {want} 이어야 합니다 "
                     "(다른 서버의 토큰으로 접속하면 오류 없이 데이터만 오지 않습니다).")
 
+        data_dir = Path(_get("DATA_DIR", "data"))
         s = cls(
             appkey=appkey,
             appsecret=_get("LS_APPSECRET"),
@@ -217,12 +221,15 @@ class Settings:
             balance_poll_sec=_get_float("BALANCE_POLL_SEC", 2.0),
             buy_fill_timeout_sec=_get_float("BUY_FILL_TIMEOUT_SEC", 60.0),
             sell_retry_sec=_get_float("SELL_RETRY_SEC", 20.0),
-            data_dir=Path(_get("DATA_DIR", "data")),
+            data_dir=data_dir,
             order_mbr_no=_get("ORDER_MBR_NO", "KRX").upper(),
             mac_address=_get("LS_MAC_ADDRESS", ""),
             data_appkey=data_appkey,
             data_appsecret=data_appsecret,
             skip_env_check=skip_env_check,
+            strategy_file=Path(_get("STRATEGY_FILE", str(data_dir / "strategy" / "strategy.json"))),
+            daily_features_file=Path(_get("DAILY_FEATURES_FILE",
+                                          str(data_dir / "strategy" / "daily_features.csv"))),
         )
         s.validate()
         return s

@@ -1,0 +1,4 @@
+# analysis\.venv-ana 용 (주간 재최적화·백테스트)
+-r ../requirements.txt
+numpy>=2.0
+pandas>=2.2
